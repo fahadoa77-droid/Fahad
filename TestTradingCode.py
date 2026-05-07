@@ -28,9 +28,8 @@ log = logging.getLogger(__name__)
 
 # Settings loaded from environment variables (for Railway / cloud hosting)
 # If not set, falls back to the hardcoded defaults below
-TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")       # Your bot token
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")     # Your chat ID
-
+TELEGRAM_TOKEN="8750346745:AAEJBJP_lCr6RLDWr9pj3tvpuRkt6f2tbpg"
+TELEGRAM_CHAT_ID="-1003562604082"
 TOP_SYMBOLS_LIMIT = int(os.environ.get("TOP_SYMBOLS_LIMIT", "50"))
 SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", "60"))
 
