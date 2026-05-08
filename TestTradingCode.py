@@ -5,7 +5,7 @@ import numpy as np
 import time
 import logging
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -30,11 +30,11 @@ TOP_SYMBOLS_LIMIT = int(os.environ.get(“TOP_SYMBOLS_LIMIT”, “50”))
 PORT              = int(os.environ.get(“PORT”, “8080”))
 DEBUG_MODE        = os.environ.get(“DEBUG_MODE”, “false”).lower() == “true”
 
-# عدد العملات تُفحص بنفس الوقت — لا تزيد عن 8
+# عدد العملات تُفحص بنفس الوقت
 
 PARALLEL_WORKERS = 8
 
-# ثواني بعد إغلاق الشمعة قبل الفحص (تأكد البيانات وصلت)
+# ثواني بعد إغلاق الشمعة قبل الفحص
 
 CANDLE_DELAY_SEC = 3
 
@@ -51,13 +51,67 @@ TIMEFRAMES = [
 
 # ═══════════════════════════════════════════════════════════
 
-# Core Code - Do NOT edit
+# Core Code - Do NOT edit below (except what’s marked)
 
 # ═══════════════════════════════════════════════════════════
 
-state      = {}
-state_lock = threading.Lock()
-cache_lock = threading.Lock()
+state        = {}
+state_lock   = threading.Lock()
+cache_lock   = threading.Lock()
+
+# ─── Trade History ───────────────────────────────────────
+
+trades_history = []
+trades_lock    = threading.Lock()
+
+def save_trade(symbol, frame, price, leverage, lowest_low, drop_pct):
+trade = {
+“time”:       datetime.now(timezone.utc),
+“symbol”:     symbol,
+“frame”:      frame,
+“price”:      price,
+“leverage”:   leverage,
+“lowest_low”: lowest_low,
+“drop_pct”:   drop_pct,
+}
+with trades_lock:
+trades_history.append(trade)
+
+def get_trades_report(period: str) -> str:
+now = datetime.now(timezone.utc)
+if period == “today”:
+start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+title = “📅 صفقات اليوم”
+elif period == “yesterday”:
+start = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+end   = now.replace(hour=0, minute=0, second=0, microsecond=0)
+title = “📅 صفقات أمس”
+elif period == “week”:
+start = now - timedelta(days=7)
+title = “📅 صفقات الأسبوع”
+else:
+return “❌ أمر غير معروف”
+
+```
+with trades_lock:
+    if period == "yesterday":
+        filtered = [t for t in trades_history if start <= t["time"] < end]
+    else:
+        filtered = [t for t in trades_history if t["time"] >= start]
+
+if not filtered:
+    return f"{title}\n\nلا توجد صفقات في هذه الفترة."
+
+lines = [f"{title} ({len(filtered)} صفقة)\n{'─'*30}"]
+for t in filtered:
+    lines.append(
+        f"🟢 {t['symbol']} | {t['frame']}\n"
+        f"   السعر: {t['price']:.6f} | رافعة: {t['leverage']}x\n"
+        f"   أدنى سعر: {t['lowest_low']:.6f} ({t['drop_pct']:.2f}%)\n"
+        f"   الوقت: {t['time'].strftime('%Y-%m-%d %H:%M')} UTC"
+    )
+return "\n\n".join(lines)
+```
 
 MEXC_BASE = “https://contract.mexc.com/api/v1/contract”
 
@@ -70,7 +124,11 @@ self.send_header(“Content-Type”, “text/plain”)
 self.end_headers()
 with state_lock:
 active = len(state)
-self.wfile.write(f”Bot running. Active filters: {active}\n”.encode())
+with trades_lock:
+total = len(trades_history)
+self.wfile.write(
+f”Bot running. Active filters: {active} | Total signals: {total}\n”.encode()
+)
 def log_message(self, format, *args):
 pass
 
@@ -83,7 +141,7 @@ log.info(f”Health server on port {PORT}”)
 except Exception as e:
 log.warning(f”Health server failed: {e}”)
 
-# ─── Terminal / Telegram ─────────────────────────────────
+# ─── Telegram ────────────────────────────────────────────
 
 def print_signal(msg):
 print(”\n” + “=”*60 + “\n” + msg + “\n” + “=”*60 + “\n”)
@@ -99,6 +157,75 @@ timeout=15
 ).raise_for_status()
 except Exception as e:
 log.error(f”Telegram error: {e}”)
+
+# ─── Telegram Commands Polling ───────────────────────────
+
+_last_update_id = 0
+
+def poll_telegram_commands():
+global _last_update_id
+while True:
+try:
+resp = requests.get(
+f”https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates”,
+params={“offset”: _last_update_id + 1, “timeout”: 30},
+timeout=40
+)
+data = resp.json()
+if not data.get(“ok”):
+time.sleep(5)
+continue
+
+```
+        for update in data.get("result", []):
+            _last_update_id = update["update_id"]
+            msg = update.get("message", {})
+            text = msg.get("text", "").strip().lower()
+            chat_id = str(msg.get("chat", {}).get("id", ""))
+
+            # السماح فقط للـ chat المحدد
+            if chat_id != TELEGRAM_CHAT_ID.lstrip("-"):
+                if f"-{chat_id}" != TELEGRAM_CHAT_ID and chat_id != TELEGRAM_CHAT_ID:
+                    continue
+
+            if text in ["/today", "/اليوم"]:
+                report = get_trades_report("today")
+                send_telegram(report)
+            elif text in ["/yesterday", "/امس", "/أمس"]:
+                report = get_trades_report("yesterday")
+                send_telegram(report)
+            elif text in ["/week", "/الاسبوع", "/الأسبوع"]:
+                report = get_trades_report("week")
+                send_telegram(report)
+            elif text in ["/status", "/حالة"]:
+                with state_lock:
+                    active = len(state)
+                with trades_lock:
+                    total = len(trades_history)
+                send_telegram(
+                    f"📊 حالة البوت\n"
+                    f"فلاتر نشطة: {active}\n"
+                    f"إجمالي الإشارات: {total}"
+                )
+            elif text in ["/help", "/مساعدة"]:
+                send_telegram(
+                    "📋 الأوامر المتاحة:\n\n"
+                    "/today — صفقات اليوم\n"
+                    "/yesterday — صفقات أمس\n"
+                    "/week — صفقات الأسبوع\n"
+                    "/status — حالة البوت\n"
+                    "/help — قائمة الأوامر"
+                )
+
+    except Exception as e:
+        log.error(f"Telegram poll error: {e}")
+        time.sleep(10)
+```
+
+def start_command_listener():
+t = threading.Thread(target=poll_telegram_commands, daemon=True)
+t.start()
+log.info(“Telegram command listener started”)
 
 # ─── Leverage ────────────────────────────────────────────
 
@@ -133,7 +260,6 @@ cache_key = f”{symbol}*{base_label}_{fetch_limit}”
     with cache_lock:
         if cache_key in _bar_cache:
             df = _bar_cache[cache_key].copy()
-            # Resample if needed then return
             if base_min != minutes:
                 df = df.resample(f"{minutes}min", origin='start_day',
                                  closed='left', label='left').agg(
@@ -141,7 +267,6 @@ cache_key = f”{symbol}*{base_label}_{fetch_limit}”
                      "close":"last","volume":"sum"}).dropna()
             return df.tail(limit)
 
-    # API call outside lock
     end_ts   = int(time.time())
     start_ts = end_ts - (fetch_limit * base_min * 60)
 
@@ -252,7 +377,9 @@ kk=100*(df[“close”]-ll)/(hh-ll).replace(0,np.nan)
 ks_=kk.rolling(ks).mean()
 return ks_, ks_.rolling(ds).mean()
 
-def calc_donchian(df, p=10):
+# ✅ تعديل #1 — Donchian period: 10 → 20
+
+def calc_donchian(df, p=20):
 return df[“close”] > (df[“high”].rolling(p).max()+df[“low”].rolling(p).min())/2
 
 # ─── Filter / Entry / Ongoing / Cancel ───────────────────
@@ -264,7 +391,8 @@ dc = get_bars(sym, conf_min, 100)
 if dm.empty or len(dm)<60: return False
 sv,*=calc_smi(dm)
 if pd.isna(sv.iloc[-1]) or sv.iloc[-1]>-40: return False
-if dm[“close”].iloc[-1]>=ema(dm[“close”],40).iloc[-1]: return False
+# ✅ تعديل #2 — EMA: 40 → 60
+if dm[“close”].iloc[-1]>=ema(dm[“close”],60).iloc[-1]: return False
 if not calc_donchian(dm).iloc[-1]: return False
 *,*,hm=calc_macd(dm)
 if hm.iloc[-1]>=0: return False
@@ -333,7 +461,7 @@ s=df[df.index>=ft]
 return min(s[“low”].min(), current_low) if not s.empty else current_low
 except: return current_low
 
-# ─── Process One Symbol (runs in thread) ─────────────────
+# ─── Process One Symbol ──────────────────────────────────
 
 def process_symbol(symbol, now):
 for (label, main_min, entry_min, conf_min, cancel_min) in TIMEFRAMES:
@@ -371,6 +499,10 @@ sym_state = state.get(key, {})
                 if lowest_low == float("inf"): lowest_low = price
                 leverage = calc_leverage(price, lowest_low)
                 drop_pct = (price - lowest_low) / price * 100 if price > 0 else 0
+
+                # حفظ الصفقة في السجل
+                save_trade(symbol, label, price, leverage, lowest_low, drop_pct)
+
                 msg = (f"🟢 BUY SIGNAL!\n"
                        f"Symbol: <b>{symbol}</b>\n"
                        f"Frame: <b>{label}</b>\n"
@@ -399,9 +531,6 @@ sym_state = state.get(key, {})
 # ─── Wait Until Next Candle Close ────────────────────────
 
 def wait_for_next_candle():
-“””
-ينتظر حتى إغلاق الشمعة القادمة (بداية الدقيقة القادمة + CANDLE_DELAY_SEC)
-“””
 now = datetime.now(timezone.utc)
 secs_left = 60 - now.second - now.microsecond / 1_000_000
 wait = secs_left + CANDLE_DELAY_SEC
@@ -412,34 +541,49 @@ time.sleep(wait)
 
 def main():
 start_health_server()
+start_command_listener()
 
 ```
-startup_msg = "✅ MEXC Futures Bot is running! Loading symbols..."
-print_signal(startup_msg); send_telegram(startup_msg)
+now_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M') + " UTC"
+startup_msg = (
+    f"✅ MEXC Futures Bot — تم التشغيل!\n"
+    f"{'─'*30}\n"
+    f"📊 الرموز المراقبة: {TOP_SYMBOLS_LIMIT}\n"
+    f"🕯 الفريمات: {len(TIMEFRAMES)}\n"
+    f"⚡ Workers: {PARALLEL_WORKERS}\n"
+    f"📐 Donchian: 20 | EMA: 60\n"
+    f"🕐 وقت التشغيل: {now_str}\n"
+    f"{'─'*30}\n"
+    f"📋 الأوامر:\n"
+    f"/today — صفقات اليوم\n"
+    f"/yesterday — صفقات أمس\n"
+    f"/week — صفقات الأسبوع\n"
+    f"/status — حالة البوت\n"
+    f"/help — قائمة الأوامر"
+)
+print_signal(startup_msg)
+send_telegram(startup_msg)
 
 symbols = get_top_symbols(limit=TOP_SYMBOLS_LIMIT)
 if not symbols:
     print("❌ Failed to load symbols."); return
 
-ready_msg = (f"✅ Loaded {len(symbols)} symbols\n"
-             f"📊 Timeframes: {len(TIMEFRAMES)}\n"
-             f"⚡ Parallel workers: {PARALLEL_WORKERS}\n"
-             f"🕯 Synced to 1-minute candle close")
+ready_msg = (f"✅ تم تحميل {len(symbols)} عملة\n"
+             f"📊 الفريمات: {len(TIMEFRAMES)}\n"
+             f"⚡ Workers: {PARALLEL_WORKERS}\n"
+             f"🕯 مزامنة مع إغلاق الشمعة")
 print_signal(ready_msg); send_telegram(ready_msg)
 
 while True:
     try:
-        # ── انتظر إغلاق الشمعة ──
         wait_for_next_candle()
 
         now = datetime.now(timezone.utc)
         log.info(f"🔍 Scanning at {now.strftime('%H:%M:%S')} UTC")
 
-        # ── امسح الكاش لكل دورة جديدة ──
         with cache_lock:
             _bar_cache.clear()
 
-        # ── فحص متوازي لكل العملات ──
         with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as executor:
             futures = {
                 executor.submit(process_symbol, sym, now): sym
