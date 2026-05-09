@@ -15,7 +15,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-# بيانات التلجرام (تأكد من تحديث التوكن إذا قمت بتغييره)
+# بيانات التلجرام
 TELEGRAM_TOKEN   = "8750346745:AAEJBJP_lCr6RLDWr9pj3tvpuRkt6f2tbpg"
 TELEGRAM_CHAT_ID = "-1003562604082"
 TOP_SYMBOLS_LIMIT = 100
@@ -23,11 +23,10 @@ PORT              = int(os.environ.get("PORT", "8080"))
 SCAN_EVERY_SEC    = 300 
 
 # تعريف العلاقات (فريم الدخول: فريم التأكيد المضروب في 3)
-# ملاحظة: تم اختيار أقرب فريمات متاحة في MEXC API
 HTF_RELATION = {
     "15m": "45m",
     "30m": "90m",
-    "45m": "2h",   # 45*3 = 135min (~2h)
+    "45m": "2h",
     "1h":  "3h",
     "2h":  "6h",
     "4h":  "12h"
@@ -67,11 +66,11 @@ def get_report(period="today"):
     if period == "today":
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         end = now
-        title = "📅 إشارات اليوم"
+        title = "📅 إشارات اليوم المكتملة"
     elif period == "yesterday":
         end = now.replace(hour=0, minute=0, second=0, microsecond=0)
         start = end - timedelta(days=1)
-        title = "📅 إشارات أمس"
+        title = "📅 إشارات أمس المكتملة"
     else:
         start = now - timedelta(days=7)
         end = now
@@ -80,7 +79,7 @@ def get_report(period="today"):
     with trades_lock:
         filtered = [t for t in trades_history if start <= t["time"] < end]
     
-    if not filtered: return f"<b>{title}:</b>\nلا توجد إشارات محققة."
+    if not filtered: return f"<b>{title}:</b>\nلا توجد إشارات محققة بالكامل."
     
     lines = [f"<b>{title} ({len(filtered)})</b>\n" + "━"*15]
     for t in filtered:
@@ -101,7 +100,7 @@ def poll_telegram_commands():
                     if text == "1": send_telegram(get_report("today"))
                     elif text == "2": send_telegram(get_report("yesterday"))
                     elif text == "3": send_telegram(get_report("week"))
-                    elif text == "/status": send_telegram("🤖 البوت يعمل بنظام الترابط الهرمي...")
+                    elif text == "/status": send_telegram("🤖 البوت يعمل (تنبيهات مكتملة فقط)...")
         except: time.sleep(10)
 
 # ──────────────────────────────────────────────────────────
@@ -118,10 +117,15 @@ def get_ohlcv(symbol, tf):
     except: return pd.DataFrame()
 
 # ──────────────────────────────────────────────────────────
-# HIERARCHICAL STRATEGY (The Core Logic)
+# HIERARCHICAL STRATEGY (Modified Logic)
 # ──────────────────────────────────────────────────────────
 def check_logic(df):
-    if df.empty or len(df) < 35: return False, 0, 0
+    """
+    تقوم هذه الدالة بفحص الشروط وإرجاع True فقط إذا تحققت جميعها.
+    """
+    if df.empty or len(df) < 35: 
+        return False, 0, 0
+    
     close = df['close']
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
@@ -130,40 +134,48 @@ def check_logic(df):
     
     m, h = macd_line.iloc[-2], hist.iloc[-2]
     
-    cond1 = h < 0
-    cond2 = m >= h
+    # الشروط المطلوبة
+    cond1 = h < 0  # الهستوجرام تحت الصفر
+    cond2 = m >= h # الخط الأزرق فوق الهستوجرام
     max_macd = macd_line.tail(24).max()
-    cond3 = m <= (max_macd * 0.20) if max_macd > 0 else m <= 0
+    cond3 = m <= (max_macd * 0.20) if max_macd > 0 else m <= 0 # الماكد في قاع (أقل من 20% من القمة الأخيرة)
     
-    return (cond1 and cond2 and cond3), m, h
+    # لن تعيد True إلا إذا كانت كل الشروط محققة (3 من 3)
+    is_fully_passed = all([cond1, cond2, cond3])
+    
+    return is_fully_passed, m, h
 
 def run_strategy_cycle(symbol):
-    # نمر على كل علاقة (دخول -> تأكيد)
     for entry_tf, confirm_tf in HTF_RELATION.items():
-        # 1. فحص فريم التأكيد أولاً (المضروب في 3)
+        # 1. فحص فريم التأكيد (يجب أن يكون محققاً بالكامل)
         df_confirm = get_ohlcv(symbol, confirm_tf)
         is_confirmed, _, _ = check_logic(df_confirm)
         
         if not is_confirmed:
-            continue # إذا لم يتحقق الأكبر، نتجاوز فحص الأصغر لهذه العملة
+            continue # تخطي إذا لم يتحقق الفريم الأكبر 100%
             
-        # 2. فحص فريم الدخول (الثلث)
+        # 2. فحص فريم الدخول (يجب أن يكون محققاً بالكامل)
         df_entry = get_ohlcv(symbol, entry_tf)
         is_entry, m, h = check_logic(df_entry)
-        last_ts = df_entry['ts'].iloc[-2] if not df_entry.empty else None
         
+        if not is_entry:
+            continue # تخطي إذا لم يتحقق فريم الدخول 100%
+            
+        # إذا وصلنا هنا، يعني الفريمين محققين 100%
+        last_ts = df_entry['ts'].iloc[-2] if not df_entry.empty else None
         key = f"{symbol}_{entry_tf}_{last_ts}"
-        if is_entry and key not in alerted_keys:
+        
+        if key not in alerted_keys:
             alerted_keys.add(key)
             save_signal(symbol, df_entry['close'].iloc[-2], entry_tf)
             
             msg = (
-                f"🚀 <b>دخول مؤكد (نظام الـ 3 أضعاف)</b>\n"
+                f"🚨 <b>إشارة دخول مكتملة 100%</b>\n"
                 f"━━━━━━━━━━━━━━\n"
                 f"🪙 العملة: <b>{symbol}</b>\n"
-                f"✅ تأكيد الأكبر: {confirm_tf}\n"
-                f"🎯 فريم الدخول: <b>{entry_tf}</b>\n"
-                f"💰 السعر: {df_entry['close'].iloc[-2]:.6g}\n"
+                f"📊 فريم التأكيد: {confirm_tf} (✅)\n"
+                f"🎯 فريم الدخول: <b>{entry_tf} (✅)</b>\n"
+                f"💰 سعر الدخول: {df_entry['close'].iloc[-2]:.6g}\n"
                 f"━━━━━━━━━━━━━━"
             )
             send_telegram(msg)
@@ -172,13 +184,13 @@ def run_strategy_cycle(symbol):
 # RUNNER
 # ──────────────────────────────────────────────────────────
 def main():
-    log.info("Starting Hierarchical MACD Bot...")
+    log.info("Starting Hierarchical MACD Bot (Final Signal Only)...")
     threading.Thread(target=poll_telegram_commands, daemon=True).start()
     
     # سيرفر البقاء حياً
     threading.Thread(target=lambda: HTTPServer(("0.0.0.0", PORT), BaseHTTPRequestHandler).serve_forever(), daemon=True).start()
 
-    send_telegram("🚀 <b>تم تشغيل البوت!</b>\nالنظام: تأكيد الفريم المضروب بـ 3 قبل دخول الثلث.")
+    send_telegram("🚀 <b>تم تشغيل البوت بنجاح!</b>\nلن يتم إرسال أي تنبيه إلا في حال اكتمال كافة الشروط.")
 
     while True:
         try:
