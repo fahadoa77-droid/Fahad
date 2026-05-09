@@ -15,37 +15,44 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-# ضع توكن البوت الخاص بك هنا (تأكد من سريته دائماً)
+# بيانات التلجرام (تأكد من تحديث التوكن إذا قمت بتغييره)
 TELEGRAM_TOKEN   = "8750346745:AAEJBJP_lCr6RLDWr9pj3tvpuRkt6f2tbpg"
 TELEGRAM_CHAT_ID = "-1003562604082"
 TOP_SYMBOLS_LIMIT = 100
 PORT              = int(os.environ.get("PORT", "8080"))
-SCAN_EVERY_SEC    = 300  # فحص كل 5 دقائق
-TIMEFRAME         = "1h" # فريم الساعة
+SCAN_EVERY_SEC    = 300 
+
+# تعريف العلاقات (فريم الدخول: فريم التأكيد المضروب في 3)
+# ملاحظة: تم اختيار أقرب فريمات متاحة في MEXC API
+HTF_RELATION = {
+    "15m": "45m",
+    "30m": "90m",
+    "45m": "2h",   # 45*3 = 135min (~2h)
+    "1h":  "3h",
+    "2h":  "6h",
+    "4h":  "12h"
+}
 
 # ──────────────────────────────────────────────────────────
 # STATE MANAGEMENT
 # ──────────────────────────────────────────────────────────
 alerted_keys = set()
 trades_history = []
-state_lock = threading.Lock()
 trades_lock = threading.Lock()
 
-def save_signal(symbol, price, m, s, h):
+def save_signal(symbol, price, tf):
     signal = {
         "time": datetime.now(timezone.utc),
         "symbol": symbol,
         "price": price,
-        "macd": m,
-        "signal": s,
-        "hist": h
+        "timeframe": tf
     }
     with trades_lock:
         trades_history.append(signal)
-        if len(trades_history) > 500: trades_history.pop(0)
+        if len(trades_history) > 2000: trades_history.pop(0)
 
 # ──────────────────────────────────────────────────────────
-# TELEGRAM LOGIC (Commands & Sending)
+# TELEGRAM LOGIC
 # ──────────────────────────────────────────────────────────
 def send_telegram(message):
     try:
@@ -58,20 +65,26 @@ def send_telegram(message):
 def get_report(period="today"):
     now = datetime.now(timezone.utc)
     if period == "today":
-        start = now.replace(hour=0, minute=0, second=0)
-        title = "إشارات اليوم"
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = now
+        title = "📅 إشارات اليوم"
+    elif period == "yesterday":
+        end = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        start = end - timedelta(days=1)
+        title = "📅 إشارات أمس"
     else:
         start = now - timedelta(days=7)
-        title = "إشارات الأسبوع"
+        end = now
+        title = "🗓️ إشارات آخر 7 أيام"
     
     with trades_lock:
-        filtered = [t for t in trades_history if t["time"] >= start]
+        filtered = [t for t in trades_history if start <= t["time"] < end]
     
-    if not filtered: return f"<b>{title}:</b>\nلا توجد إشارات حتى الآن."
+    if not filtered: return f"<b>{title}:</b>\nلا توجد إشارات محققة."
     
     lines = [f"<b>{title} ({len(filtered)})</b>\n" + "━"*15]
     for t in filtered:
-        lines.append(f"✅ {t['symbol']} | {t['price']:.4g} | {t['time'].strftime('%H:%M')}")
+        lines.append(f"✅ {t['symbol']} | {t['timeframe']} | {t['price']:.4g} | {t['time'].strftime('%H:%M')}")
     return "\n".join(lines)
 
 def poll_telegram_commands():
@@ -84,32 +97,20 @@ def poll_telegram_commands():
                 for update in resp.get("result", []):
                     last_id = update["update_id"]
                     msg = update.get("message", {})
-                    text = msg.get("text", "").lower()
-                    if text == "/today": send_telegram(get_report("today"))
-                    elif text == "/week": send_telegram(get_report("week"))
-                    elif text == "/status": send_telegram("🤖 Bot is active and scanning MEXC...")
+                    text = msg.get("text", "").strip()
+                    if text == "1": send_telegram(get_report("today"))
+                    elif text == "2": send_telegram(get_report("yesterday"))
+                    elif text == "3": send_telegram(get_report("week"))
+                    elif text == "/status": send_telegram("🤖 البوت يعمل بنظام الترابط الهرمي...")
         except: time.sleep(10)
 
 # ──────────────────────────────────────────────────────────
-# DATA FETCHING (MEXC REST API)
+# DATA FETCHING
 # ──────────────────────────────────────────────────────────
-MEXC_BASE = "https://api.mexc.com/api/v3"
-
-def get_top_symbols():
+def get_ohlcv(symbol, tf):
     try:
-        resp = requests.get(f"{MEXC_BASE}/ticker/24hr").json()
-        # تصفية أزواج USDT فقط وترتيبها حسب السيولة
-        symbols = [s for s in resp if s['symbol'].endswith('USDT')]
-        symbols.sort(key=lambda x: float(x['quoteVolume']), reverse=True)
-        return [s['symbol'] for s in symbols[:TOP_SYMBOLS_LIMIT]]
-    except Exception as e:
-        log.error(f"Error fetching symbols: {e}")
-        return []
-
-def get_ohlcv(symbol):
-    try:
-        params = {"symbol": symbol, "interval": TIMEFRAME, "limit": 100}
-        resp = requests.get(f"{MEXC_BASE}/klines", params=params).json()
+        params = {"symbol": symbol, "interval": tf, "limit": 50}
+        resp = requests.get("https://api.mexc.com/api/v3/klines", params=params, timeout=10).json()
         df = pd.DataFrame(resp, columns=['ts', 'open', 'high', 'low', 'close', 'vol', 'close_ts', 'quote_vol'])
         df['close'] = df['close'].astype(float)
         df['ts'] = pd.to_datetime(df['ts'], unit='ms')
@@ -117,84 +118,83 @@ def get_ohlcv(symbol):
     except: return pd.DataFrame()
 
 # ──────────────────────────────────────────────────────────
-# MACD STRATEGY
+# HIERARCHICAL STRATEGY (The Core Logic)
 # ──────────────────────────────────────────────────────────
-def check_macd(symbol):
-    df = get_ohlcv(symbol)
-    if df.empty or len(df) < 35: return
-
-    # حساب المؤشرات
+def check_logic(df):
+    if df.empty or len(df) < 35: return False, 0, 0
     close = df['close']
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
     macd_line = ema12 - ema26
-    signal_line = macd_line.ewm(span=9, adjust=False).mean()
-    hist = macd_line - signal_line
-
-    # القيم الأخيرة (للشمعة المغلقة)
-    m, s, h = macd_line.iloc[-2], signal_line.iloc[-2], hist.iloc[-2]
-    last_ts = df['ts'].iloc[-2]
-
-    # منع التكرار
-    key = f"{symbol}_{last_ts}"
-    if key in alerted_keys: return
+    hist = macd_line - macd_line.ewm(span=9, adjust=False).mean()
     
-    # --- الشروط ---
-    # 1. الهيستوجرام أحمر
+    m, h = macd_line.iloc[-2], hist.iloc[-2]
+    
     cond1 = h < 0
-    # 2. الماكد (الأزرق) فوق الهيستوجرام (لا يغلق أسفله)
     cond2 = m >= h
-    # 3. الماكد قريب من خط الصفر (أقل من 20% من أقصى ارتفاع مؤخراً)
     max_macd = macd_line.tail(24).max()
     cond3 = m <= (max_macd * 0.20) if max_macd > 0 else m <= 0
-
-    if cond1 and cond2 and cond3:
-        alerted_keys.add(key)
-        save_signal(symbol, close.iloc[-2], m, s, h)
-        
-        msg = (
-            f"📡 <b>إشارة MACD جديدة</b>\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"🪙 العملة: <b>{symbol}</b>\n"
-            f"⏱ الفريم: {TIMEFRAME}\n"
-            f"💰 السعر: {close.iloc[-2]:.6g}\n"
-            f"📊 Hist: {h:.6g} (🔴)\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"✅ شروط الاستراتيجية محققة"
-        )
-        send_telegram(msg)
-        log.info(f"Signal Found: {symbol}")
-
-# ──────────────────────────────────────────────────────────
-# MAIN RUNNER
-# ──────────────────────────────────────────────────────────
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot is alive")
-
-def run_health_server():
-    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-    server.serve_forever()
-
-def main():
-    log.info("Starting MACD Multi-Threaded Bot...")
     
-    # تشغيل سيرفر الصحة والأوامر في خلفية البرنامج
-    threading.Thread(target=run_health_server, daemon=True).start()
-    threading.Thread(target=poll_telegram_commands, daemon=True).start()
+    return (cond1 and cond2 and cond3), m, h
 
-    send_telegram("🚀 <b>تم تشغيل البوت بنجاح!</b>\nيتم الآن مراقبة أفضل 100 عملة.")
+def run_strategy_cycle(symbol):
+    # نمر على كل علاقة (دخول -> تأكيد)
+    for entry_tf, confirm_tf in HTF_RELATION.items():
+        # 1. فحص فريم التأكيد أولاً (المضروب في 3)
+        df_confirm = get_ohlcv(symbol, confirm_tf)
+        is_confirmed, _, _ = check_logic(df_confirm)
+        
+        if not is_confirmed:
+            continue # إذا لم يتحقق الأكبر، نتجاوز فحص الأصغر لهذه العملة
+            
+        # 2. فحص فريم الدخول (الثلث)
+        df_entry = get_ohlcv(symbol, entry_tf)
+        is_entry, m, h = check_logic(df_entry)
+        last_ts = df_entry['ts'].iloc[-2] if not df_entry.empty else None
+        
+        key = f"{symbol}_{entry_tf}_{last_ts}"
+        if is_entry and key not in alerted_keys:
+            alerted_keys.add(key)
+            save_signal(symbol, df_entry['close'].iloc[-2], entry_tf)
+            
+            msg = (
+                f"🚀 <b>دخول مؤكد (نظام الـ 3 أضعاف)</b>\n"
+                f"━━━━━━━━━━━━━━\n"
+                f"🪙 العملة: <b>{symbol}</b>\n"
+                f"✅ تأكيد الأكبر: {confirm_tf}\n"
+                f"🎯 فريم الدخول: <b>{entry_tf}</b>\n"
+                f"💰 السعر: {df_entry['close'].iloc[-2]:.6g}\n"
+                f"━━━━━━━━━━━━━━"
+            )
+            send_telegram(msg)
+
+# ──────────────────────────────────────────────────────────
+# RUNNER
+# ──────────────────────────────────────────────────────────
+def main():
+    log.info("Starting Hierarchical MACD Bot...")
+    threading.Thread(target=poll_telegram_commands, daemon=True).start()
+    
+    # سيرفر البقاء حياً
+    threading.Thread(target=lambda: HTTPServer(("0.0.0.0", PORT), BaseHTTPRequestHandler).serve_forever(), daemon=True).start()
+
+    send_telegram("🚀 <b>تم تشغيل البوت!</b>\nالنظام: تأكيد الفريم المضروب بـ 3 قبل دخول الثلث.")
 
     while True:
-        symbols = get_top_symbols()
-        # استخدام ThreadPoolExecutor لتسريع الفحص (Parallel Processing)
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            executor.map(check_macd, symbols)
-        
-        log.info(f"Scan complete. Sleeping {SCAN_EVERY_SEC}s")
-        time.sleep(SCAN_EVERY_SEC)
+        try:
+            resp = requests.get("https://api.mexc.com/api/v3/ticker/24hr").json()
+            symbols = sorted([s for s in resp if s['symbol'].endswith('USDT')], 
+                             key=lambda x: float(x['quoteVolume']), reverse=True)[:TOP_SYMBOLS_LIMIT]
+            top_symbols = [s['symbol'] for s in symbols]
+
+            with ThreadPoolExecutor(max_workers=15) as executor:
+                executor.map(run_strategy_cycle, top_symbols)
+            
+            log.info("Cycle complete.")
+            time.sleep(SCAN_EVERY_SEC)
+        except Exception as e:
+            log.error(f"Loop Error: {e}")
+            time.sleep(30)
 
 if __name__ == "__main__":
     main()
