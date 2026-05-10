@@ -21,7 +21,7 @@ log = logging.getLogger(**name**)
 # بيانات التلجرام
 
 TELEGRAM_TOKEN   = “8750346745:AAEJBJP_lCr6RLDWr9pj3tvpuRkt6f2tbpg”
-TELEGRAM_CHAT_ID = “-1003562604082”
+TELEGRAM_CHAT_ID = “-1003853071475”
 TOP_SYMBOLS_LIMIT = 100
 PORT              = int(os.environ.get(“PORT”, “8080”))
 SCAN_EVERY_SEC    = 300
