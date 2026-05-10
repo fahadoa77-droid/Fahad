@@ -126,9 +126,9 @@ def get_ohlcv(symbol, tf):
 try:
 params = {“symbol”: symbol, “interval”: tf, “limit”: 50}
 resp = requests.get(“https://api.mexc.com/api/v3/klines”, params=params, timeout=10).json()
-df = pd.DataFrame(resp, columns=[‘ts’, ‘open’, ‘high’, ‘low’, ‘close’, ‘vol’, ‘close_ts’, ‘quote_vol’])
-df[‘close’] = df[‘close’].astype(float)
-df[‘ts’] = pd.to_datetime(df[‘ts’], unit=‘ms’)
+df = pd.DataFrame(resp, columns=[“ts”, “open”, “high”, “low”, “close”, “vol”, “close_ts”, “quote_vol”])
+df[“close”] = df[“close”].astype(float)
+df[“ts”] = pd.to_datetime(df[“ts”], unit=“ms”)
 return df
 except: return pd.DataFrame()
 
@@ -143,7 +143,7 @@ if df.empty or len(df) < 35:
 return False, 0, 0
 
 ```
-close = df['close']
+close = df["close"]
 ema12 = close.ewm(span=12, adjust=False).mean()
 ema26 = close.ewm(span=26, adjust=False).mean()
 macd_line = ema12 - ema26
@@ -169,20 +169,20 @@ is_confirmed, _, _ = check_logic(df_confirm)
 ```
     if not is_confirmed:
         continue
-        
+
     df_entry = get_ohlcv(symbol, entry_tf)
     is_entry, m, h = check_logic(df_entry)
-    
+
     if not is_entry:
         continue
-        
-    last_ts = df_entry['ts'].iloc[-2] if not df_entry.empty else None
+
+    last_ts = df_entry["ts"].iloc[-2] if not df_entry.empty else None
     key = f"{symbol}_{entry_tf}_{last_ts}"
-    
+
     if key not in alerted_keys:
         alerted_keys.add(key)
-        save_signal(symbol, df_entry['close'].iloc[-2], entry_tf)
-        
+        save_signal(symbol, df_entry["close"].iloc[-2], entry_tf)
+
         msg = (
             f"🚨 <b>إشارة دخول مكتملة 100%</b>\n"
             f"━━━━━━━━━━━━━━\n"
@@ -197,7 +197,7 @@ is_confirmed, _, _ = check_logic(df_confirm)
 
 # ──────────────────────────────────────────────────────────
 
-# HEALTH CHECK SERVER (الإصلاح: يرد بـ 200 OK)
+# HEALTH CHECK SERVER
 
 # ──────────────────────────────────────────────────────────
 
@@ -207,7 +207,7 @@ self.send_response(200)
 self.end_headers()
 self.wfile.write(b”OK”)
 def log_message(self, *args):
-pass  # إخفاء logs السيرفر
+pass
 
 # ──────────────────────────────────────────────────────────
 
@@ -220,7 +220,6 @@ log.info(“Starting Hierarchical MACD Bot (Final Signal Only)…”)
 threading.Thread(target=poll_telegram_commands, daemon=True).start()
 
 ```
-# سيرفر البقاء حياً - مع HealthHandler بدل BaseHTTPRequestHandler
 threading.Thread(target=lambda: HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever(), daemon=True).start()
 
 send_telegram("🚀 <b>تم تشغيل البوت بنجاح!</b>\nلن يتم إرسال أي تنبيه إلا في حال اكتمال كافة الشروط.")
@@ -228,13 +227,13 @@ send_telegram("🚀 <b>تم تشغيل البوت بنجاح!</b>\nلن يتم �
 while True:
     try:
         resp = requests.get("https://api.mexc.com/api/v3/ticker/24hr").json()
-        symbols = sorted([s for s in resp if s['symbol'].endswith('USDT')], 
-                         key=lambda x: float(x['quoteVolume']), reverse=True)[:TOP_SYMBOLS_LIMIT]
-        top_symbols = [s['symbol'] for s in symbols]
+        symbols = sorted([s for s in resp if s["symbol"].endswith("USDT")],
+                         key=lambda x: float(x["quoteVolume"]), reverse=True)[:TOP_SYMBOLS_LIMIT]
+        top_symbols = [s["symbol"] for s in symbols]
 
         with ThreadPoolExecutor(max_workers=15) as executor:
             executor.map(run_strategy_cycle, top_symbols)
-        
+
         log.info("Cycle complete.")
         time.sleep(SCAN_EVERY_SEC)
     except Exception as e:
