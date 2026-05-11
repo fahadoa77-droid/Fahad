@@ -479,7 +479,6 @@ for base_tf, tf_minutes in BASE_TF_MINUTES.items():
 # ابقِ البرنامج شغّالاً
 while True:
     time.sleep(60)
-```
 
 if __name__ == "__main__":
-main()
+    main()
