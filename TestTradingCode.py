@@ -17,8 +17,8 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 logging.basicConfig(level=logging.INFO, format=”%(asctime)s %(levelname)s %(message)s”)
 log = logging.getLogger(**name**)
 
-TELEGRAM_TOKEN   = “8750346745:AAEJBJP_lCr6RLDWr9pj3tvpuRkt6f2tbpg”
-TELEGRAM_CHAT_ID = “-1003853071475”
+TELEGRAM_TOKEN    = “8750346745:AAEJBJP_lCr6RLDWr9pj3tvpuRkt6f2tbpg”
+TELEGRAM_CHAT_ID  = “-1003853071475”
 TOP_SYMBOLS_LIMIT = 100
 PORT              = int(os.environ.get(“PORT”, “8080”))
 SCAN_EVERY_SEC    = 300
@@ -38,16 +38,13 @@ HTF_RELATION = {
 
 # ──────────────────────────────────────────────────────────
 
-# alerted_keys مع وقت الإنتهاء لمنع التراكم اللانهائي
-
-alerted_keys: dict[str, datetime] = {}
+alerted_keys: dict = {}
 ALERT_EXPIRY_HOURS = 4
 
 trades_history = []
 trades_lock = threading.Lock()
 
 def cleanup_alerted_keys():
-“”“تنظيف المفاتيح القديمة كل دورة”””
 now = datetime.now(timezone.utc)
 expired = [k for k, t in alerted_keys.items() if now - t > timedelta(hours=ALERT_EXPIRY_HOURS)]
 for k in expired:
@@ -74,7 +71,6 @@ trades_history.pop(0)
 # ──────────────────────────────────────────────────────────
 
 def send_telegram(message: str) -> bool:
-“”“إرسال رسالة تلجرام مع تفاصيل الخطأ”””
 try:
 url = f”https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage”
 payload = {
@@ -90,13 +86,13 @@ data = resp.json()
         log.error(f"Telegram API Error: {data.get('description')} | error_code={data.get('error_code')}")
         return False
 
-    log.info("Telegram message sent successfully ✅")
+    log.info("Telegram message sent successfully")
     return True
 
 except requests.exceptions.Timeout:
-    log.error("Telegram timeout - تحقق من الاتصال بالإنترنت")
+    log.error("Telegram timeout")
 except requests.exceptions.ConnectionError:
-    log.error("Telegram connection error - لا يوجد اتصال")
+    log.error("Telegram connection error")
 except Exception as e:
     log.error(f"Telegram unexpected error: {e}")
 return False
@@ -124,7 +120,7 @@ with trades_lock:
 if not filtered:
     return f"<b>{title}:</b>\nلا توجد إشارات."
 
-lines = [f"<b>{title} ({len(filtered)})</b>\n" + "━"*15]
+lines = [f"<b>{title} ({len(filtered)})</b>\n" + "━" * 15]
 for t in filtered:
     lines.append(
         f"✅ {t['symbol']} | {t['timeframe']} | "
@@ -152,9 +148,12 @@ timeout=35
                 msg  = update.get("message", {})
                 text = msg.get("text", "").strip()
 
-                if   text == "1":       send_telegram(get_report("today"))
-                elif text == "2":       send_telegram(get_report("yesterday"))
-                elif text == "3":       send_telegram(get_report("week"))
+                if text == "1":
+                    send_telegram(get_report("today"))
+                elif text == "2":
+                    send_telegram(get_report("yesterday"))
+                elif text == "3":
+                    send_telegram(get_report("week"))
                 elif text == "/status":
                     with trades_lock:
                         count = len(trades_history)
@@ -178,7 +177,6 @@ timeout=35
 # ──────────────────────────────────────────────────────────
 
 def get_ohlcv(symbol: str, tf: str) -> pd.DataFrame:
-“”“جلب بيانات الشموع مع تسجيل الأخطاء”””
 try:
 params = {“symbol”: symbol, “interval”: tf, “limit”: 50}
 resp = requests.get(
@@ -194,7 +192,7 @@ timeout=10
 
     df = pd.DataFrame(
         resp,
-        columns=["ts","open","high","low","close","vol","close_ts","quote_vol"]
+        columns=["ts", "open", "high", "low", "close", "vol", "close_ts", "quote_vol"]
     )
     df["close"] = df["close"].astype(float)
     df["ts"]    = pd.to_datetime(df["ts"], unit="ms")
@@ -212,30 +210,24 @@ except Exception as e:
 # ──────────────────────────────────────────────────────────
 
 def check_logic(df: pd.DataFrame):
-“””
-شروط MACD الثلاثة:
-1. الهستوغرام سالب
-2. خط MACD >= الهستوغرام
-3. خط MACD <= 20% من أعلى قيمة خلال 24 شمعة
-“””
 if df.empty or len(df) < 35:
 return False, 0, 0
 
 ```
-close    = df["close"]
-ema12    = close.ewm(span=12, adjust=False).mean()
-ema26    = close.ewm(span=26, adjust=False).mean()
+close     = df["close"]
+ema12     = close.ewm(span=12, adjust=False).mean()
+ema26     = close.ewm(span=26, adjust=False).mean()
 macd_line = ema12 - ema26
-signal   = macd_line.ewm(span=9, adjust=False).mean()
-hist     = macd_line - signal
+signal    = macd_line.ewm(span=9, adjust=False).mean()
+hist      = macd_line - signal
 
 m = macd_line.iloc[-2]
 h = hist.iloc[-2]
 
-cond1 = h < 0
-cond2 = m >= h
+cond1    = h < 0
+cond2    = m >= h
 max_macd = macd_line.tail(24).max()
-cond3 = (m <= max_macd * 0.20) if max_macd > 0 else (m <= 0)
+cond3    = (m <= max_macd * 0.20) if max_macd > 0 else (m <= 0)
 
 passed = all([cond1, cond2, cond3])
 return passed, m, h
@@ -243,7 +235,6 @@ return passed, m, h
 
 def run_strategy_cycle(symbol: str):
 for entry_tf, confirm_tf in HTF_RELATION.items():
-# ── فريم التأكيد ──
 df_confirm = get_ohlcv(symbol, confirm_tf)
 is_confirmed, mc, hc = check_logic(df_confirm)
 
@@ -253,11 +244,10 @@ is_confirmed, mc, hc = check_logic(df_confirm)
     if not is_confirmed:
         continue
 
-    # ── فريم الدخول ──
     df_entry = get_ohlcv(symbol, entry_tf)
     is_entry, m, h = check_logic(df_entry)
 
-    log.info(f"🔍 {symbol} HTF={confirm_tf}✅ | LTF={entry_tf} entry={is_entry} | m={m:.6f} h={h:.6f}")
+    log.info(f"🔍 {symbol} HTF={confirm_tf} | LTF={entry_tf} entry={is_entry} | m={m:.6f} h={h:.6f}")
 
     if not is_entry:
         continue
@@ -295,8 +285,11 @@ def do_GET(self):
 self.send_response(200)
 self.end_headers()
 self.wfile.write(b”OK”)
+
+```
 def log_message(self, *args):
-pass
+    pass
+```
 
 # ──────────────────────────────────────────────────────────
 
@@ -308,11 +301,18 @@ def main():
 log.info(“Starting Hierarchical MACD Bot…”)
 
 ```
-# ── اختبار اتصال تلجرام فوراً ──
 log.info("Testing Telegram connection...")
-ok = send_telegram("🚀 <b>تم تشغيل البوت بنجاح!</b>\n⏳ سيبدأ المسح الآن...\n\nالأوامر:\n1 = إشارات اليوم\n2 = إشارات أمس\n3 = آخر 7 أيام\n/status = حالة البوت")
+ok = send_telegram(
+    "🚀 <b>تم تشغيل البوت بنجاح!</b>\n"
+    "⏳ سيبدأ المسح الآن...\n\n"
+    "الأوامر:\n"
+    "1 = إشارات اليوم\n"
+    "2 = إشارات أمس\n"
+    "3 = آخر 7 أيام\n"
+    "/status = حالة البوت"
+)
 if not ok:
-    log.error("❌ فشل إرسال رسالة تلجرام - تحقق من TOKEN و CHAT_ID")
+    log.error("فشل إرسال رسالة تلجرام - تحقق من TOKEN و CHAT_ID")
 
 threading.Thread(target=poll_telegram_commands, daemon=True).start()
 threading.Thread(
@@ -326,7 +326,6 @@ while True:
         cycle += 1
         log.info(f"=== Cycle #{cycle} started ===")
 
-        # جلب أعلى 100 عملة بالحجم
         resp = requests.get(
             "https://api.mexc.com/api/v3/ticker/24hr",
             timeout=15
