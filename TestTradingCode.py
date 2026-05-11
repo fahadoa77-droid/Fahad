@@ -17,7 +17,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 logging.basicConfig(level=logging.INFO, format=”%(asctime)s %(levelname)s %(message)s”)
 log = logging.getLogger(**name**)
 
-TELEGRAM_TOKEN    = “8750346745:AAEJBJP_lCr6RLDWr9pj3tvpuRkt6f2tbpg”
+TELEGRAM_TOKEN    = “8298845980:AAHPepkUjfwOFasLYybmgzJRY6N69LbLMF8”
 TELEGRAM_CHAT_ID  = “-1003853071475”
 TOP_SYMBOLS_LIMIT = 100
 PORT              = int(os.environ.get(“PORT”, “8080”))
