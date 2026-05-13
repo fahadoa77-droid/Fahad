@@ -11,9 +11,8 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-# ✅ إصلاح: بيانات حساسة من متغيرات البيئة
-TELEGRAM_TOKEN     = os.environ.get("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_TOKEN     = "8298845980:AAHPepkUjfwOFasLYybmgzJRY6N69LbLMF8"
+TELEGRAM_CHAT_ID   = "-1003853071475"
 TOP_SYMBOLS_LIMIT  = 100
 PORT               = int(os.environ.get("PORT", "8080"))
 ALERT_EXPIRY_HOURS = 4
@@ -74,10 +73,6 @@ def save_signal(symbol, price, tf):
         if len(trades_history) > 2000:
             trades_history.pop(0)
 
-
-# ─────────────────────────────────────────────
-# TELEGRAM
-# ─────────────────────────────────────────────
 
 def send_telegram(message: str) -> bool:
     try:
@@ -160,10 +155,6 @@ def poll_telegram_commands():
             time.sleep(10)
 
 
-# ─────────────────────────────────────────────
-# DATA - Session مستقلة لكل thread
-# ─────────────────────────────────────────────
-
 _thread_local = threading.local()
 
 
@@ -176,7 +167,6 @@ def get_session() -> requests.Session:
 
 
 def get_ohlcv(symbol: str, tf: str, limit: int = 500, retries: int = 3) -> pd.DataFrame:
-    """✅ إصلاح: إضافة retry عند فشل الطلب"""
     for attempt in range(retries):
         try:
             resp = get_session().get(
@@ -207,7 +197,6 @@ def get_ohlcv(symbol: str, tf: str, limit: int = 500, retries: int = 3) -> pd.Da
 
 
 def resample_ohlcv(df: pd.DataFrame, target_minutes: int) -> pd.DataFrame:
-    """✅ إصلاح: حماية من target_minutes غير صالح أو df فارغ"""
     if df.empty or target_minutes <= 0:
         return pd.DataFrame()
     resampled = df.copy().set_index("ts").resample(
@@ -221,10 +210,6 @@ def resample_ohlcv(df: pd.DataFrame, target_minutes: int) -> pd.DataFrame:
     }).dropna()
     return resampled.iloc[:-1].reset_index()
 
-
-# ─────────────────────────────────────────────
-# STRATEGY
-# ─────────────────────────────────────────────
 
 def check_logic(df: pd.DataFrame):
     if df.empty or len(df) < 35:
@@ -266,7 +251,6 @@ def scan_symbol(symbol: str, base_tf: str):
                     if entry_min
                     else raw_df.iloc[:-1].reset_index(drop=True))
 
-        # ✅ إصلاح: حماية من df_entry فارغ قبل الوصول إلى بياناته
         if df_entry.empty:
             continue
 
@@ -280,7 +264,6 @@ def scan_symbol(symbol: str, base_tf: str):
         if not is_entry:
             continue
 
-        # ✅ إصلاح: التحقق من وجود عمود ts قبل القراءة
         last_ts = df_entry["ts"].iloc[-1] if "ts" in df_entry.columns else None
         key     = f"{symbol}_{entry_label}_{last_ts}"
 
@@ -305,10 +288,6 @@ def scan_symbol(symbol: str, base_tf: str):
             )
             log.info(f"✅ Signal sent: {symbol} {entry_label}")
 
-
-# ─────────────────────────────────────────────
-# CANDLE CLOSE WATCHER
-# ─────────────────────────────────────────────
 
 def get_next_close(tf_minutes: int) -> datetime:
     now   = datetime.now(timezone.utc)
@@ -344,17 +323,12 @@ def candle_watcher(base_tf: str, tf_minutes: int):
 
         start_scan = time.time()
 
-        # ✅ إصلاح: تقليل عدد الـ workers لتجنب حظر IP من MEXC
         with ThreadPoolExecutor(max_workers=20) as executor:
             executor.map(lambda s: scan_symbol(s, base_tf), symbols)
 
         elapsed = time.time() - start_scan
         log.info(f"✅ {base_tf}: انتهى المسح ({len(symbols)} عملة) في {elapsed:.1f}ث")
 
-
-# ─────────────────────────────────────────────
-# SYMBOLS UPDATER
-# ─────────────────────────────────────────────
 
 def update_symbols_loop():
     while True:
@@ -388,10 +362,6 @@ def update_symbols_loop():
         time.sleep(3600)
 
 
-# ─────────────────────────────────────────────
-# HEALTH CHECK
-# ─────────────────────────────────────────────
-
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -402,16 +372,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         pass
 
 
-# ─────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────
-
 def main():
-    # ✅ إصلاح: التحقق من وجود المتغيرات الضرورية
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.error("❌ TELEGRAM_TOKEN أو TELEGRAM_CHAT_ID غير موجود في متغيرات البيئة!")
-        return
-
     log.info("🚀 Starting MACD Bot - Candle Close Mode")
 
     send_telegram(
