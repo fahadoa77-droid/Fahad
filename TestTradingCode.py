@@ -204,6 +204,37 @@ def get_ohlcv(symbol: str, tf: str, limit: int = 500, retries: int = 3) -> pd.Da
             time.sleep(1)
 
     return pd.DataFrame()
+def get_full_history(symbol: str, tf: str) -> pd.DataFrame:
+    all_data = []
+    end_time = None
+    while True:
+        params = {"symbol": symbol, "interval": tf, "limit": 1000}
+        if end_time:
+            params["endTime"] = end_time
+        try:
+            resp = get_session().get(
+                "https://api.mexc.com/api/v3/klines",
+                params=params, timeout=8
+            ).json()
+            if not resp or not isinstance(resp, list) or len(resp) < 2:
+                break
+            df = pd.DataFrame(resp, columns=[
+                "ts","open","high","low","close","vol","close_ts","quote_vol"
+            ])
+            for col in ["open","high","low","close","vol"]:
+                df[col] = df[col].astype(float)
+            df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+            all_data.append(df)
+            if len(resp) < 1000:
+                break
+            end_time = int(df["ts"].iloc[0].timestamp() * 1000) - 1
+            time.sleep(0.1)
+        except Exception as e:
+            log.error(f"get_full_history error {symbol} {tf}: {e}")
+            break
+    if not all_data:
+        return pd.DataFrame()
+    return pd.concat(all_data[::-1]).drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
 
 
 def resample_ohlcv(df: pd.DataFrame, target_minutes: int) -> pd.DataFrame:
@@ -370,13 +401,13 @@ def check_rsi_stoch(df: pd.DataFrame, stoch_lookback=5) -> bool:
 # ─── المسح ────────────────────────────────────────────────────────────────────
 
 def scan_symbol(symbol: str, base_tf: str):
-    raw_df = get_ohlcv(symbol, base_tf, limit=1000)
+    raw_df = get_full_history(symbol, base_tf)
     if raw_df.empty:
         return
 
     # جلب بيانات الفريم الصغير للثلث (5m)
     small_tf, small_minutes = BASE_TF_SMALL_FETCH.get(base_tf, ("5m", 5))
-    raw_small_df = get_ohlcv(symbol, small_tf, limit=1000)
+    raw_small_df = get_full_history(symbol, small_tf)
 
     for entry_label, entry_min, confirm_min in PAIRS_BY_BASE.get(base_tf, []):
 
