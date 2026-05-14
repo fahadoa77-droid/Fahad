@@ -310,6 +310,13 @@ def check_donchian_green(df: pd.DataFrame, period: int = 20) -> bool:
     low_min  = df["low"].rolling(period).min()
     mid      = (high_max + low_min) / 2
     return df["close"].iloc[-1] >= mid.iloc[-1]
+def check_donchian_red(df: pd.DataFrame, period: int = 20) -> bool:
+    if df.empty or len(df) < period:
+        return False
+    high_max = df["high"].rolling(period).max()
+    low_min  = df["low"].rolling(period).min()
+    mid      = (high_max + low_min) / 2
+    return df["close"].iloc[-1] < mid.iloc[-1]
 
 
 def check_close_below_ema50(df: pd.DataFrame) -> bool:
@@ -395,8 +402,8 @@ def scan_symbol(symbol: str, base_tf: str):
             continue
 
         # 3. Donchian Trend Ribbon أخضر
-        if not check_donchian_green(df_entry):
-            log.debug(f"{symbol} {entry_label}: Donchian فريم الدخول ليس أخضر")
+        if not check_donchian_red(df_entry):
+            log.debug(f"{symbol} {entry_label}: Donchian فريم الدخول ليس أحمر")
             continue
 
         # 4. الشمعة تغلق تحت EMA 50
@@ -435,8 +442,10 @@ def scan_symbol(symbol: str, base_tf: str):
             continue
 
         # 7. RSI تقاطع إيجابي + Stochastic فوق 20
-        if not check_rsi_stoch(df_third):
+            if not check_rsi_stoch(df_third):
             log.debug(f"{symbol} {entry_label}: RSI/Stoch فريم الثلث لم يتحقق")
+            continue
+            if not check_donchian_red(df_third):
             continue
 
         # ─── إرسال الإشارة ───────────────────────────────
