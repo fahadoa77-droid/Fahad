@@ -442,10 +442,10 @@ def scan_symbol(symbol: str, base_tf: str):
             continue
 
         # 7. RSI تقاطع إيجابي + Stochastic فوق 20
-            if not check_rsi_stoch(df_third):
+        if not check_rsi_stoch(df_third):
             log.debug(f"{symbol} {entry_label}: RSI/Stoch فريم الثلث لم يتحقق")
             continue
-            if not check_donchian_red(df_third):
+        if not check_donchian_red(df_third):
             continue
 
         # ─── إرسال الإشارة ───────────────────────────────
