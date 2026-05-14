@@ -370,13 +370,13 @@ def check_rsi_stoch(df: pd.DataFrame, stoch_lookback=5) -> bool:
 # ─── المسح ────────────────────────────────────────────────────────────────────
 
 def scan_symbol(symbol: str, base_tf: str):
-    raw_df = get_ohlcv(symbol, base_tf, limit=500)
+    raw_df = get_ohlcv(symbol, base_tf, limit=1000)
     if raw_df.empty:
         return
 
     # جلب بيانات الفريم الصغير للثلث (5m)
     small_tf, small_minutes = BASE_TF_SMALL_FETCH.get(base_tf, ("5m", 5))
-    raw_small_df = get_ohlcv(symbol, small_tf, limit=500)
+    raw_small_df = get_ohlcv(symbol, small_tf, limit=1000)
 
     for entry_label, entry_min, confirm_min in PAIRS_BY_BASE.get(base_tf, []):
 
