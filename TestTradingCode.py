@@ -19,12 +19,10 @@ TOP_SYMBOLS_LIMIT  = 100
 PORT               = int(os.environ.get("PORT", "8080"))
 ALERT_EXPIRY_HOURS = 4
 
-# entry_label, entry_min, confirm_min
-# entry_min=None يعني نستخدم base_tf مباشرة
 PAIRS_BY_BASE = {
     "15m": [
-        ("15m", None, 40),
-        ("45m", 45,  120),
+        ("15m", None, 45),
+        ("45m", 45,  135),
     ],
     "30m": [
         ("30m", None, 90),
@@ -45,7 +43,6 @@ BASE_TF_MINUTES = {
     "4h":  240,
 }
 
-# أصغر فريم متاح في MEXC لكل base_tf لجلب بيانات الثلث
 BASE_TF_SMALL_FETCH = {
     "15m": ("5m",  5),
     "30m": ("5m",  5),
@@ -383,7 +380,6 @@ def scan_symbol(symbol: str, base_tf: str):
         if df_entry.empty:
             continue
 
-        # احسب دقائق فريم الدخول
         actual_entry_min = entry_min if entry_min else BASE_TF_MINUTES[base_tf]
 
         # ─── شروط فريم الدخول ───────────────────────────
@@ -428,7 +424,6 @@ def scan_symbol(symbol: str, base_tf: str):
 
         # ─── شروط فريم الثلث (RSI + Stoch) ─────────────
 
-        # فريم الثلث = entry_minutes ÷ 3
         third_minutes = max(round(actual_entry_min / 3), 1)
         df_third = pd.DataFrame()
 
@@ -582,12 +577,12 @@ def main():
         "7️⃣ RSI يتقاطع إيجابي فوق SMA14\n"
         "8️⃣ Stochastic يتخطى 20\n\n"
         "الفريمات النشطة:\n"
-        "• 15m → تأكيد 40m | ثلث 5m\n"
-        "• 45m → تأكيد 2h  | ثلث 15m\n"
-        "• 30m → تأكيد 90m | ثلث 10m\n"
-        "• 1h  → تأكيد 3h  | ثلث 20m\n"
-        "• 2h  → تأكيد 6h  | ثلث 40m\n"
-        "• 4h  → تأكيد 12h | ثلث 80m\n\n"
+        "• 15m → تأكيد 45m  | ثلث 5m\n"
+        "• 45m → تأكيد 135m | ثلث 15m\n"
+        "• 30m → تأكيد 90m  | ثلث 10m\n"
+        "• 1h  → تأكيد 3h   | ثلث 20m\n"
+        "• 2h  → تأكيد 6h   | ثلث 40m\n"
+        "• 4h  → تأكيد 12h  | ثلث 80m\n\n"
         "الأوامر:\n"
         "1 = إشارات اليوم\n2 = إشارات أمس\n"
         "3 = آخر 7 أيام\n/status = حالة البوت"
