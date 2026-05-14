@@ -4,6 +4,7 @@ import pandas as pd
 import time
 import logging
 import threading
+from collections import deque
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -11,7 +12,8 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN     = "8298845980:AAHPepkUjfwOFasLYybmgzJRY6N69LbLMF8"
+# ─── الإعدادات ───────────────────────────────────────────────────────────────
+TELEGRAM_TOKEN     = os.environ.get("TELEGRAM_TOKEN", "8298845980:AAHPepkUjfwOFasLYybmgzJRY6N69LbLMF8")
 TELEGRAM_CHAT_ID   = "-1003853071475"
 TOP_SYMBOLS_LIMIT  = 100
 PORT               = int(os.environ.get("PORT", "8080"))
@@ -43,7 +45,7 @@ BASE_TF_MINUTES = {
 
 alerted_keys       = {}
 alerted_keys_lock  = threading.Lock()
-trades_history     = []
+trades_history     = deque(maxlen=2000)
 trades_lock        = threading.Lock()
 symbols_cache      = []
 symbols_cache_lock = threading.Lock()
@@ -70,8 +72,6 @@ def save_signal(symbol, price, tf):
             "price":     price,
             "timeframe": tf
         })
-        if len(trades_history) > 2000:
-            trades_history.pop(0)
 
 
 def send_telegram(message: str) -> bool:
@@ -157,7 +157,6 @@ def poll_telegram_commands():
 
 _thread_local = threading.local()
 
-
 def get_session() -> requests.Session:
     if not hasattr(_thread_local, "session"):
         s = requests.Session()
@@ -208,29 +207,79 @@ def resample_ohlcv(df: pd.DataFrame, target_minutes: int) -> pd.DataFrame:
         "close": "last",
         "vol":   "sum"
     }).dropna()
-    return resampled.iloc[:-1].reset_index()
+    result = resampled.iloc[:-1].reset_index()
+    if result.empty:
+        log.warning(f"resample_ohlcv: نتيجة فارغة بعد التجميع إلى {target_minutes}m")
+    return result
 
 
-def check_logic(df: pd.DataFrame):
+def calc_smi(high, low, close, k_len=10, d_len=3, ema_len=10):
+    hh       = high.rolling(k_len).max()
+    ll       = low.rolling(k_len).min()
+    midpoint = (hh + ll) / 2
+    diff     = close - midpoint
+    hl_half  = (hh - ll) / 2
+
+    ds   = diff.ewm(span=d_len, adjust=False).mean()
+    ds2  = ds.ewm(span=d_len, adjust=False).mean()
+    hls  = hl_half.ewm(span=d_len, adjust=False).mean()
+    hls2 = hls.ewm(span=d_len, adjust=False).mean()
+
+    smi    = 200 * ds2 / (hls2.abs() + 1e-10)
+    signal = smi.ewm(span=ema_len, adjust=False).mean()
+    return smi, signal
+
+
+def check_smi_oversold(df: pd.DataFrame, oversold=-40, lookback=5) -> bool:
+    if df.empty or len(df) < 30:
+        return False
+    smi, _ = calc_smi(df["high"], df["low"], df["close"])
+    return smi.iloc[-lookback:].min() <= oversold
+
+
+def check_macd_green(df: pd.DataFrame) -> bool:
     if df.empty or len(df) < 35:
-        return False, 0, 0
-
+        return False
     close     = df["close"]
     ema12     = close.ewm(span=12, adjust=False).mean()
     ema26     = close.ewm(span=26, adjust=False).mean()
     macd_line = ema12 - ema26
     signal    = macd_line.ewm(span=9, adjust=False).mean()
     hist      = macd_line - signal
+    return hist.iloc[-1] > 0
 
-    m        = macd_line.iloc[-2]
-    h        = hist.iloc[-2]
-    max_macd = macd_line.tail(24).max()
 
-    cond1 = h < 0
-    cond2 = m >= h
-    cond3 = (m <= max_macd * 0.20) if max_macd > 0 else (m <= 0)
+def check_entry_signals(df: pd.DataFrame, stoch_lookback=5) -> bool:
+    if df.empty or len(df) < 40:
+        return False
 
-    return all([cond1, cond2, cond3]), m, h
+    close = df["close"]
+    high  = df["high"]
+    low   = df["low"]
+
+    delta  = close.diff()
+    gain   = delta.clip(lower=0).ewm(span=14, adjust=False).mean()
+    loss   = (-delta.clip(upper=0)).ewm(span=14, adjust=False).mean()
+    rsi    = 100 - (100 / (1 + gain / (loss + 1e-10)))
+    rsi_ma = rsi.rolling(14).mean()
+
+    rsi_crossed = any(
+        rsi.iloc[i - 1] < rsi_ma.iloc[i - 1] and rsi.iloc[i] >= rsi_ma.iloc[i]
+        for i in range(-5, 0)
+    )
+    if not rsi_crossed:
+        return False
+
+    low15  = low.rolling(15).min()
+    high15 = high.rolling(15).max()
+    k_raw  = 100 * (close - low15) / (high15 - low15 + 1e-10)
+    k      = k_raw.rolling(3).mean()
+
+    stoch_crossed = any(
+        k.iloc[i - 1] < 20 and k.iloc[i] >= 20
+        for i in range(-stoch_lookback, 0)
+    )
+    return stoch_crossed
 
 
 def scan_symbol(symbol: str, base_tf: str):
@@ -239,33 +288,36 @@ def scan_symbol(symbol: str, base_tf: str):
         return
 
     for entry_label, entry_min, confirm_min in PAIRS_BY_BASE.get(base_tf, []):
-        df_confirm = (resample_ohlcv(raw_df, confirm_min)
-                      if confirm_min
-                      else raw_df.iloc[:-1].reset_index(drop=True))
-        is_confirmed, mc, hc = check_logic(df_confirm)
-
-        if not is_confirmed:
-            continue
 
         df_entry = (resample_ohlcv(raw_df, entry_min)
                     if entry_min
                     else raw_df.iloc[:-1].reset_index(drop=True))
-
         if df_entry.empty:
             continue
 
-        is_entry, m, h = check_logic(df_entry)
-
-        log.info(
-            f"🔍 {symbol} | {entry_label}→{confirm_min}m "
-            f"entry={is_entry} m={m:.6f}"
-        )
-
-        if not is_entry:
+        if not check_smi_oversold(df_entry):
+            log.debug(f"{symbol} {entry_label}: SMI لم يصل تشبع بيعي")
             continue
 
-        last_ts = df_entry["ts"].iloc[-1] if "ts" in df_entry.columns else None
-        key     = f"{symbol}_{entry_label}_{last_ts}"
+        if not check_macd_green(df_entry):
+            log.debug(f"{symbol} {entry_label}: MACD فريم الدخول ليس أخضر")
+            continue
+
+        df_confirm = (resample_ohlcv(raw_df, confirm_min)
+                      if confirm_min
+                      else raw_df.iloc[:-1].reset_index(drop=True))
+        if df_confirm.empty:
+            continue
+        if not check_macd_green(df_confirm):
+            log.debug(f"{symbol} {entry_label}: MACD فريم التأكيد ليس أخضر")
+            continue
+
+        if not check_entry_signals(df_entry):
+            log.debug(f"{symbol} {entry_label}: RSI/Stoch لم يتحقق")
+            continue
+
+        last_close_ts = df_entry["ts"].iloc[-1].strftime("%Y%m%d%H%M") if "ts" in df_entry.columns else "unknown"
+        key = f"{symbol}_{entry_label}_{last_close_ts}"
 
         should_send = False
         with alerted_keys_lock:
@@ -323,8 +375,9 @@ def candle_watcher(base_tf: str, tf_minutes: int):
 
         start_scan = time.time()
 
+        def _scan(s): return scan_symbol(s, base_tf)
         with ThreadPoolExecutor(max_workers=20) as executor:
-            executor.map(lambda s: scan_symbol(s, base_tf), symbols)
+            executor.map(_scan, symbols)
 
         elapsed = time.time() - start_scan
         log.info(f"✅ {base_tf}: انتهى المسح ({len(symbols)} عملة) في {elapsed:.1f}ث")
@@ -373,11 +426,16 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    log.info("🚀 Starting MACD Bot - Candle Close Mode")
+    log.info("🚀 Starting Bot - SMI + MACD + RSI + Stoch Strategy")
 
     send_telegram(
         "🚀 <b>تم تشغيل البوت!</b>\n"
-        "⚡ وضع: تنبيه فوري عند إغلاق الشمعة\n\n"
+        "⚡ الاستراتيجية الجديدة:\n\n"
+        "1️⃣ SMI تشبع بيعي (أسفل -40)\n"
+        "2️⃣ MACD أخضر (فريم الدخول)\n"
+        "3️⃣ MACD أخضر (فريم التأكيد ×3)\n"
+        "4️⃣ RSI يتقاطع فوق SMA14\n"
+        "5️⃣ Stochastic يتخطى 20 ← دخول\n\n"
         "الفريمات النشطة:\n"
         "• 15m → 45m\n• 45m → 2h\n• 30m → 90m\n"
         "• 1h  → 3h\n• 2h  → 6h\n• 4h  → 12h\n\n"
