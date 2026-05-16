@@ -1,3 +1,4 @@
+
 import os
 import requests
 import pandas as pd
@@ -204,37 +205,6 @@ def get_ohlcv(symbol: str, tf: str, limit: int = 500, retries: int = 3) -> pd.Da
             time.sleep(1)
 
     return pd.DataFrame()
-def get_full_history(symbol: str, tf: str) -> pd.DataFrame:
-    all_data = []
-    end_time = None
-    while True:
-        params = {"symbol": symbol, "interval": tf, "limit": 1000}
-        if end_time:
-            params["endTime"] = end_time
-        try:
-            resp = get_session().get(
-                "https://api.mexc.com/api/v3/klines",
-                params=params, timeout=8
-            ).json()
-            if not resp or not isinstance(resp, list) or len(resp) < 2:
-                break
-            df = pd.DataFrame(resp, columns=[
-                "ts","open","high","low","close","vol","close_ts","quote_vol"
-            ])
-            for col in ["open","high","low","close","vol"]:
-                df[col] = df[col].astype(float)
-            df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-            all_data.append(df)
-            if len(resp) < 1000:
-                break
-            end_time = int(df["ts"].iloc[0].timestamp() * 1000) - 1
-            time.sleep(1)
-        except Exception as e:
-            log.error(f"get_full_history error {symbol} {tf}: {e}")
-            break
-    if not all_data:
-        return pd.DataFrame()
-    return pd.concat(all_data[::-1]).drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
 
 
 def resample_ohlcv(df: pd.DataFrame, target_minutes: int) -> pd.DataFrame:
@@ -275,7 +245,6 @@ def calc_smi(high, low, close, k_len=10, d_len=3, ema_len=10):
 
 
 def check_smi_oversold(df: pd.DataFrame, oversold=-40, lookback=5) -> bool:
-    """SMI تشبع بيعي ≤ -40"""
     if df.empty or len(df) < 30:
         return False
     smi, _ = calc_smi(df["high"], df["low"], df["close"])
@@ -283,7 +252,6 @@ def check_smi_oversold(df: pd.DataFrame, oversold=-40, lookback=5) -> bool:
 
 
 def check_macd_green(df: pd.DataFrame) -> bool:
-    """MACD هيستوغرام موجب (أخضر ولو خفيف)"""
     if df.empty or len(df) < 35:
         return False
     close     = df["close"]
@@ -296,12 +264,6 @@ def check_macd_green(df: pd.DataFrame) -> bool:
 
 
 def check_macd_entry(df: pd.DataFrame, entry_minutes: int) -> bool:
-    """
-    شروط MACD فريم الدخول:
-    1. هيستوغرام أحمر (سالب)
-    2. Signal فوق الهيستوغرام
-    3. Signal لا يتجاوز 20% من أقصى ارتفاع له في آخر 24 ساعة
-    """
     if df.empty or len(df) < 35:
         return False
 
@@ -312,15 +274,11 @@ def check_macd_entry(df: pd.DataFrame, entry_minutes: int) -> bool:
     signal    = macd_line.ewm(span=9, adjust=False).mean()
     hist      = macd_line - signal
 
-    # شرط 1: هيستوغرام أحمر
     if hist.iloc[-1] >= 0:
         return False
-
-    # شرط 2: Signal فوق الهيستوغرام
     if signal.iloc[-1] < hist.iloc[-1]:
         return False
 
-    # شرط 3: Signal لا يتجاوز 20% من أقصى ارتفاع في آخر 24 ساعة
     candles_24h = max(int((24 * 60) / entry_minutes), 1)
     recent      = signal.iloc[-candles_24h:] if len(signal) >= candles_24h else signal
     max_signal  = recent.max()
@@ -331,16 +289,14 @@ def check_macd_entry(df: pd.DataFrame, entry_minutes: int) -> bool:
 
 
 def check_donchian_green(df: pd.DataFrame, period: int = 20) -> bool:
-    """
-    Donchian Trend Ribbon أخضر:
-    السعر فوق أو مساوي للمتوسط بين أعلى وأدنى آخر 20 شمعة
-    """
     if df.empty or len(df) < period:
         return False
     high_max = df["high"].rolling(period).max()
     low_min  = df["low"].rolling(period).min()
     mid      = (high_max + low_min) / 2
     return df["close"].iloc[-1] >= mid.iloc[-1]
+
+
 def check_donchian_red(df: pd.DataFrame, period: int = 20) -> bool:
     if df.empty or len(df) < period:
         return False
@@ -351,7 +307,6 @@ def check_donchian_red(df: pd.DataFrame, period: int = 20) -> bool:
 
 
 def check_close_below_ema50(df: pd.DataFrame) -> bool:
-    """الشمعة تغلق تحت EMA 50"""
     if df.empty or len(df) < 50:
         return False
     ema50 = df["close"].ewm(span=50, adjust=False).mean()
@@ -359,11 +314,6 @@ def check_close_below_ema50(df: pd.DataFrame) -> bool:
 
 
 def check_rsi_stoch(df: pd.DataFrame, stoch_lookback=5) -> bool:
-    """
-    فريم الثلث (للدخول فقط):
-    1. RSI يتقاطع إيجابي فوق SMA14
-    2. Stochastic فوق 20
-    """
     if df.empty or len(df) < 40:
         return False
 
@@ -371,7 +321,6 @@ def check_rsi_stoch(df: pd.DataFrame, stoch_lookback=5) -> bool:
     high  = df["high"]
     low   = df["low"]
 
-    # RSI
     delta  = close.diff()
     gain   = delta.clip(lower=0).ewm(span=14, adjust=False).mean()
     loss   = (-delta.clip(upper=0)).ewm(span=14, adjust=False).mean()
@@ -385,7 +334,6 @@ def check_rsi_stoch(df: pd.DataFrame, stoch_lookback=5) -> bool:
     if not rsi_crossed:
         return False
 
-    # Stochastic
     low15  = low.rolling(15).min()
     high15 = high.rolling(15).max()
     k_raw  = 100 * (close - low15) / (high15 - low15 + 1e-10)
@@ -405,13 +353,14 @@ def scan_symbol(symbol: str, base_tf: str):
     if raw_df.empty:
         return
 
-    # جلب بيانات الفريم الصغير للثلث (5m)
-    raw_small_df = get_ohlcv(symbol, small_tf, limit=1000)
-    raw_small_df = get_full_history(symbol, small_tf)
+    # ✅ إصلاح 1: تعريف small_tf
+    small_tf, small_tf_minutes = BASE_TF_SMALL_FETCH[base_tf]
+
+    # ✅ إصلاح 2: طلب واحد سريع - 500 شمعة 5m = ~41 ساعة كافية
+    raw_small_df = get_ohlcv(symbol, small_tf, limit=500)
 
     for entry_label, entry_min, confirm_min in PAIRS_BY_BASE.get(base_tf, []):
 
-        # فريم الدخول
         df_entry = (resample_ohlcv(raw_df, entry_min)
                     if entry_min
                     else raw_df.iloc[:-1].reset_index(drop=True))
@@ -422,22 +371,19 @@ def scan_symbol(symbol: str, base_tf: str):
 
         # ─── شروط فريم الدخول ───────────────────────────
 
-        # 1. SMI تشبع بيعي
         if not check_smi_oversold(df_entry):
             log.debug(f"{symbol} {entry_label}: SMI لم يصل تشبع بيعي")
             continue
 
-        # 2. MACD أحمر + Signal فوق الهيستوغرام + Signal ≤ 20% من أقصى ارتفاع
         if not check_macd_entry(df_entry, actual_entry_min):
             log.debug(f"{symbol} {entry_label}: MACD فريم الدخول لم يتحقق")
             continue
 
-        # 3. Donchian Trend Ribbon أخضر
-        if not check_donchian_red(df_entry):
-            log.debug(f"{symbol} {entry_label}: Donchian فريم الدخول ليس أحمر")
+        # ✅ إصلاح 3: Donchian فريم الدخول → أخضر
+        if not check_donchian_green(df_entry):
+            log.debug(f"{symbol} {entry_label}: Donchian فريم الدخول ليس أخضر")
             continue
 
-        # 4. الشمعة تغلق تحت EMA 50
         if not check_close_below_ema50(df_entry):
             log.debug(f"{symbol} {entry_label}: السعر فوق EMA50")
             continue
@@ -450,17 +396,15 @@ def scan_symbol(symbol: str, base_tf: str):
         if df_confirm.empty:
             continue
 
-        # 5. MACD أخضر
         if not check_macd_green(df_confirm):
             log.debug(f"{symbol} {entry_label}: MACD فريم التأكيد ليس أخضر")
             continue
 
-        # 6. Donchian Trend Ribbon أخضر
         if not check_donchian_green(df_confirm):
             log.debug(f"{symbol} {entry_label}: Donchian فريم التأكيد ليس أخضر")
             continue
 
-        # ─── شروط فريم الثلث (RSI + Stoch) ─────────────
+        # ─── شروط فريم الثلث ─────────────────────────────
 
         third_minutes = max(round(actual_entry_min / 3), 1)
         df_third = pd.DataFrame()
@@ -472,11 +416,12 @@ def scan_symbol(symbol: str, base_tf: str):
             log.debug(f"{symbol} {entry_label}: فريم الثلث فارغ ({third_minutes}m)")
             continue
 
-        # 7. RSI تقاطع إيجابي + Stochastic فوق 20
         if not check_rsi_stoch(df_third):
             log.debug(f"{symbol} {entry_label}: RSI/Stoch فريم الثلث لم يتحقق")
             continue
+
         if not check_donchian_red(df_third):
+            log.debug(f"{symbol} {entry_label}: Donchian فريم الثلث ليس أحمر")
             continue
 
         # ─── إرسال الإشارة ───────────────────────────────
@@ -499,7 +444,7 @@ def scan_symbol(symbol: str, base_tf: str):
                 f"🪙 العملة: <b>{symbol}</b>\n"
                 f"📊 فريم التأكيد: {confirm_min}m | MACD 🟢 | Donchian 🟢\n"
                 f"🎯 فريم الدخول: <b>{entry_label}</b> | SMI 📉 | MACD 🔴 | Donchian 🟢 | EMA50 ✅\n"
-                f"⚡ فريم الثلث: {third_minutes}m | RSI ↑ | Stoch >20\n"
+                f"⚡ فريم الثلث: {third_minutes}m | RSI ↑ | Stoch >20 | Donchian 🔴\n"
                 f"💰 سعر الدخول: {price:.6g}\n"
                 f"🕐 الوقت: {datetime.now(timezone.utc).strftime('%H:%M UTC')}\n"
                 f"━━━━━━━━━━━━━━"
@@ -543,9 +488,8 @@ def candle_watcher(base_tf: str, tf_minutes: int):
 
         start_scan = time.time()
 
-        def _scan(s): return scan_symbol(s, base_tf)
         with ThreadPoolExecutor(max_workers=20) as executor:
-            executor.map(_scan, symbols)
+            executor.map(lambda s: scan_symbol(s, base_tf), symbols)
 
         elapsed = time.time() - start_scan
         log.info(f"✅ {base_tf}: انتهى المسح ({len(symbols)} عملة) في {elapsed:.1f}ث")
@@ -613,9 +557,10 @@ def main():
         "4️⃣ MACD أحمر + Signal فوق الهيستوغرام\n"
         "5️⃣ Donchian Trend Ribbon أخضر\n"
         "6️⃣ الشمعة تغلق تحت EMA 50\n\n"
-        "<b>فريم الثلث (للدخول فقط):</b>\n"
+        "<b>فريم الثلث:</b>\n"
         "7️⃣ RSI يتقاطع إيجابي فوق SMA14\n"
-        "8️⃣ Stochastic يتخطى 20\n\n"
+        "8️⃣ Stochastic يتخطى 20\n"
+        "9️⃣ Donchian أحمر\n\n"
         "الفريمات النشطة:\n"
         "• 15m → تأكيد 45m  | ثلث 5m\n"
         "• 45m → تأكيد 135m | ثلث 15m\n"
