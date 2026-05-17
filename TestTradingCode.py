@@ -343,13 +343,17 @@ def resample_ohlcv(df: pd.DataFrame, minutes: int) -> pd.DataFrame:
 
 # ─── الحسابات الفنية ──────────────────────────────────────────────────────────
 
-def calc_smi(high, low, close, k=10, d=3, ema=10):
+def calc_smi(high, low, close, k=10, d=3, ema=10, smooth=1):
+    """SMI — نفس إعدادات surjithctly على TradingView"""
     hh  = high.rolling(k).max()
     ll  = low.rolling(k).min()
     mid = (hh + ll) / 2
     ds  = (close - mid).ewm(span=d, adjust=False).mean().ewm(span=d, adjust=False).mean()
     hls = ((hh - ll) / 2).ewm(span=d, adjust=False).mean().ewm(span=d, adjust=False).mean()
     smi = 200 * ds / (hls.abs() + 1e-10)
+    # Smoothing Period=1 يعني بدون smoothing إضافي
+    if smooth > 1:
+        smi = smi.rolling(smooth).mean()
     sig = smi.ewm(span=ema, adjust=False).mean()
     return smi, sig
 
@@ -429,9 +433,11 @@ def check_rsi_stoch(df: pd.DataFrame, lookback=5) -> bool:
     )
     if not rsi_cross:
         return False
-    lo14 = low.rolling(14).min()
-    hi14 = high.rolling(14).max()
-    k    = (100 * (close - lo14) / (hi14 - lo14 + 1e-10)).rolling(3).mean()
+    lo15 = low.rolling(15).min()
+    hi15 = high.rolling(15).max()
+    k_raw = 100 * (close - lo15) / (hi15 - lo15 + 1e-10)
+    k     = k_raw.rolling(3).mean()   # %K smooth=3
+    d     = k.rolling(3).mean()        # %D smooth=3
     return any(k.iloc[i-1] < 20 and k.iloc[i] >= 20 for i in range(-lookback, 0))
 
 # ─── تقرير التشخيص ──────────────────────────────────────────────────────────
