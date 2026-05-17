@@ -15,7 +15,7 @@ log = logging.getLogger(__name__)
 
 # ─── الإعدادات ──────────────────────────────────────────────────────────────
 
-TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "8298845980:AAHPepkUjfw0FasLYybmgzJRY6N69LbLMF8")
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "8298845980:AAFrhgrdngO6b1vV9poLyw7c_yT0afTkMg4")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "-1003853071475")
 TOP_SYMBOLS_LIMIT = 70
 PORT = int(os.environ.get("PORT", "8080"))
@@ -344,14 +344,12 @@ def resample_ohlcv(df: pd.DataFrame, minutes: int) -> pd.DataFrame:
 # ─── الحسابات الفنية ──────────────────────────────────────────────────────────
 
 def calc_smi(high, low, close, k=10, d=3, ema=10, smooth=1):
-    """SMI — نفس إعدادات surjithctly على TradingView"""
     hh  = high.rolling(k).max()
     ll  = low.rolling(k).min()
     mid = (hh + ll) / 2
     ds  = (close - mid).ewm(span=d, adjust=False).mean().ewm(span=d, adjust=False).mean()
     hls = ((hh - ll) / 2).ewm(span=d, adjust=False).mean().ewm(span=d, adjust=False).mean()
     smi = 200 * ds / (hls.abs() + 1e-10)
-    # Smoothing Period=1 يعني بدون smoothing إضافي
     if smooth > 1:
         smi = smi.rolling(smooth).mean()
     sig = smi.ewm(span=ema, adjust=False).mean()
@@ -401,7 +399,6 @@ def check_ema50_below(df: pd.DataFrame) -> bool:
     return bool(df["close"].iloc[-1] < ema.iloc[-1])
 
 def wilder_rma(series: pd.Series, period: int) -> pd.Series:
-    """Wilder's RMA — نفس طريقة TradingView"""
     result = series.copy() * 0.0
     result.iloc[period - 1] = series.iloc[:period].mean()
     alpha = 1 / period
@@ -410,7 +407,6 @@ def wilder_rma(series: pd.Series, period: int) -> pd.Series:
     return result
 
 def calc_rsi_tv(close: pd.Series, period: int = 14) -> pd.Series:
-    """RSI بطريقة TradingView (Wilder's RMA)"""
     delta = close.diff()
     gain  = delta.clip(lower=0)
     loss  = (-delta.clip(upper=0))
@@ -436,8 +432,8 @@ def check_rsi_stoch(df: pd.DataFrame, lookback=5) -> bool:
     lo15 = low.rolling(15).min()
     hi15 = high.rolling(15).max()
     k_raw = 100 * (close - lo15) / (hi15 - lo15 + 1e-10)
-    k     = k_raw.rolling(3).mean()   # %K smooth=3
-    d     = k.rolling(3).mean()        # %D smooth=3
+    k     = k_raw.rolling(3).mean()
+    d     = k.rolling(3).mean()
     return any(k.iloc[i-1] < 20 and k.iloc[i] >= 20 for i in range(-lookback, 0))
 
 # ─── تقرير التشخيص ──────────────────────────────────────────────────────────
@@ -570,8 +566,6 @@ def get_next_close(tf_minutes: int) -> datetime:
     total = int((now - epoch).total_seconds() / 60)
     return epoch + timedelta(minutes=((total // tf_minutes) + 1) * tf_minutes)
 
-# ─── ✅ إصلاح 4: استبدال lambda بـ partial في candle_watcher ─────────────────
-
 def candle_watcher(entry_min: int, confirm_min: int, third_min: int, ec_api: str, t_api: str):
     while True:
         nxt  = get_next_close(entry_min)
@@ -624,15 +618,10 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 def main():
     log.info("🚀 Tripling Strategy Bot — Starting")
-
-    # ✅ إصلاح 1: حذف الـ Webhook أول شي
     delete_webhook()
-
     threading.Thread(target=update_symbols_loop, daemon=True).start()
-
     while not symbols_cache:
         time.sleep(1)
-
     threading.Thread(target=poll_telegram_commands, daemon=True).start()
     threading.Thread(target=cache_updater_1m,       daemon=True).start()
     threading.Thread(target=cache_updater_60m,      daemon=True).start()
@@ -641,17 +630,14 @@ def main():
         target=lambda: HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever(),
         daemon=True
     ).start()
-
     log.info("⏳ جاري جلب البيانات التاريخية...")
     prefetch_done.wait()
-
     for entry_min, confirm_min, third_min, ec_api, t_api in TRIPLING_PAIRS:
         threading.Thread(
             target=candle_watcher,
             args=(entry_min, confirm_min, third_min, ec_api, t_api),
             daemon=True
         ).start()
-
     log.info("✅ جميع الواتشرز تعمل.")
     while True:
         time.sleep(60)
