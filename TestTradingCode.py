@@ -15,8 +15,8 @@ log = logging.getLogger(__name__)
 
 # ─── الإعدادات ──────────────────────────────────────────────────────────────
 
-TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "8298845980:AAHPepkUjfw0FasLYybmgzJRY6N69LbLMF8")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "-1003853071475")
 TOP_SYMBOLS_LIMIT = 70
 PORT = int(os.environ.get("PORT", "8080"))
 ALERT_EXPIRY_HOURS = 4
