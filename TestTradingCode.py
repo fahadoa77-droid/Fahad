@@ -15,7 +15,7 @@ log = logging.getLogger(__name__)
 # ─── الإعدادات ──────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
-TOP_SYMBOLS_LIMIT = 70  # تم تقليله من 300 لحمايتك من الحظر من MEXC
+TOP_SYMBOLS_LIMIT = 70
 PORT = int(os.environ.get("PORT", "8080"))
 ALERT_EXPIRY_HOURS = 4
 
@@ -29,9 +29,9 @@ TRIPLING_PAIRS = [
     ( 27, 81, 9, "1m", "1m" ),
     ( 30, 90, 10, "1m", "1m" ),
     ( 45, 135, 15, "1m", "1m" ),
-    ( 60, 180, 20, "60m", "1m" ), 
-    ( 120, 360, 40, "60m", "1m" ), 
-    ( 180, 540, 60, "60m", "60m" ), 
+    ( 60, 180, 20, "60m", "1m" ),
+    ( 120, 360, 40, "60m", "1m" ),
+    ( 180, 540, 60, "60m", "60m" ),
 ]
 
 API_FETCH_CANDLES = { "1m" : 7_680, "60m": 1_500 }
@@ -48,6 +48,22 @@ symbols_cache_lock = threading.Lock()
 ohlcv_cache = {}
 ohlcv_cache_lock = threading.Lock()
 prefetch_done = threading.Event()
+
+# ─── عدادات التشخيص ──────────────────────────────────────────────────────────
+diag_counts = {
+    "total"           : 0,
+    "no_data"         : 0,
+    "macd_confirm"    : 0,
+    "donchian_confirm": 0,
+    "smi_oversold"    : 0,
+    "macd_entry"      : 0,
+    "donchian_entry"  : 0,
+    "ema50"           : 0,
+    "rsi_stoch"       : 0,
+    "donchian_third"  : 0,
+    "passed"          : 0,
+}
+diag_lock = threading.Lock()
 
 _local = threading.local()
 
@@ -68,9 +84,9 @@ def cleanup_alerted_keys():
 def save_signal(symbol, price, entry_min, confirm_min, third_min):
     with trades_lock:
         trades_history.append({
-            "time" : datetime.now(timezone.utc),
-            "symbol" : symbol,
-            "price" : price,
+            "time"     : datetime.now(timezone.utc),
+            "symbol"   : symbol,
+            "price"    : price,
             "timeframe": f"{entry_min}m/{confirm_min}m/{third_min}m",
         })
 
@@ -121,11 +137,11 @@ def poll_telegram_commands():
                 for upd in r.get("result", []):
                     last_id = upd["update_id"]
                     txt = upd.get("message", {}).get("text", "").strip()
-                    if txt == "1": send_telegram(get_report("today"))
-                    elif txt == "2": send_telegram(get_report("yesterday"))
-                    elif txt == "3": send_telegram(get_report("week"))
+                    if txt == "1":        send_telegram(get_report("today"))
+                    elif txt == "2":     send_telegram(get_report("yesterday"))
+                    elif txt == "3":     send_telegram(get_report("week"))
                     elif txt == "/status":
-                        with trades_lock: cnt = len(trades_history)
+                        with trades_lock:      cnt = len(trades_history)
                         with alerted_keys_lock: active = len(alerted_keys)
                         send_telegram(f"🤖 البوت يعمل\n📊 إجمالي الإشارات: {cnt}\n🔑 نشطة: {active}\n💾 كاش: {len(ohlcv_cache)}")
         except Exception as e:
@@ -167,7 +183,7 @@ def get_ohlcv_full(symbol: str, tf: str, target: int) -> pd.DataFrame:
             fetched += len(resp)
             if len(resp) < limit: break
             end_ms = int(resp[0][0]) - 1
-            time.sleep(0.1) # زيادة الأمان لمنع الـ Block
+            time.sleep(0.1)
         except Exception as e:
             log.error(f"full fetch error {symbol}: {e}")
             time.sleep(2)
@@ -213,7 +229,7 @@ def _update_batch(symbols, tf, limit):
         try:
             df = get_ohlcv(sym, tf, limit=limit)
             if not df.empty: cache_merge(sym, tf, df)
-            time.sleep(0.1) # حماية الـ Rate limit أثناء التحديث الدوري
+            time.sleep(0.1)
         except Exception as e:
             log.error(f"update {sym} {tf}: {e}")
 
@@ -222,7 +238,7 @@ def cache_updater_1m():
         time.sleep(45)
         if prefetch_done.is_set():
             with symbols_cache_lock: syms = list(symbols_cache)
-            if syms: _update_batch(syms, "1m", limit=15) # رفع الـ limit لضمان عدم فوات أي شمعة
+            if syms: _update_batch(syms, "1m", limit=15)
 
 def cache_updater_60m():
     while True:
@@ -298,28 +314,98 @@ def check_rsi_stoch(df: pd.DataFrame, lookback=5) -> bool:
     rma_l = (-delta.clip(upper=0)).ewm(alpha=alpha, adjust=False).mean()
     rsi = 100 - (100 / (1 + rma_g / (rma_l + 1e-10)))
     rsi_ma = rsi.rolling(14).mean()
-    if rsi.iloc[-10:].min() > 35: return False
-    rsi_cross = any(rsi.iloc[i-1] < rsi_ma.iloc[i-1] and rsi.iloc[i] >= rsi_ma.iloc[i] for i in range(-5, 0))
+    # ✅ تعديل: آخر 20 شمعة بدل 10
+    if rsi.iloc[-20:].min() > 35: return False
+    # ✅ تعديل: كروس في آخر 10 شمعات بدل 5
+    rsi_cross = any(rsi.iloc[i-1] < rsi_ma.iloc[i-1] and rsi.iloc[i] >= rsi_ma.iloc[i] for i in range(-10, 0))
     if not rsi_cross: return False
     lo14 = low.rolling(14).min()
     hi14 = high.rolling(14).max()
     k = (100 * (close - lo14) / (hi14 - lo14 + 1e-10)).rolling(3).mean()
     return any(k.iloc[i-1] < 20 and k.iloc[i] >= 20 for i in range(-lookback, 0))
 
+# ─── تقرير التشخيص ──────────────────────────────────────────────────────────
+def send_diag_report():
+    while True:
+        time.sleep(3600)
+        with diag_lock:
+            t = diag_counts["total"] or 1
+            non_total = {k: v for k, v in diag_counts.items() if k not in ["total", "passed"]}
+            worst = max(non_total, key=lambda k: non_total[k])
+            msg = (
+                f"🔍 <b>تقرير التشخيص</b>\n"
+                f"━━━━━━━━━━━━━━━\n"
+                f"📊 إجمالي الفحوصات: {t}\n"
+                f"❌ بيانات ناقصة: {diag_counts['no_data']}\n"
+                f"❌ MACD Confirm: {diag_counts['macd_confirm']}\n"
+                f"❌ Donchian Confirm: {diag_counts['donchian_confirm']}\n"
+                f"❌ SMI Oversold: {diag_counts['smi_oversold']}\n"
+                f"❌ MACD Entry: {diag_counts['macd_entry']}\n"
+                f"❌ Donchian Entry: {diag_counts['donchian_entry']}\n"
+                f"❌ EMA50: {diag_counts['ema50']}\n"
+                f"❌ RSI/Stoch: {diag_counts['rsi_stoch']}\n"
+                f"❌ Donchian Third: {diag_counts['donchian_third']}\n"
+                f"✅ اجتاز الكل: {diag_counts['passed']}\n"
+                f"━━━━━━━━━━━━━━━\n"
+                f"🏆 أكثر سبب فشل: {worst}"
+            )
+            for k in diag_counts:
+                diag_counts[k] = 0
+        send_telegram(msg)
+
+# ─── فحص العملات ─────────────────────────────────────────────────────────────
 def scan_symbol(symbol: str, entry_min: int, confirm_min: int, third_min: int, ec_api: str, t_api: str):
     raw_ec = get_cached(symbol, ec_api)
-    raw_t = get_cached(symbol, t_api)
-    if raw_ec.empty or len(raw_ec) < 150 or raw_t.empty or len(raw_t) < 150: return
+    raw_t  = get_cached(symbol, t_api)
 
-    df_entry = resample_ohlcv(raw_ec, entry_min)
+    with diag_lock:
+        diag_counts["total"] += 1
+
+    if raw_ec.empty or len(raw_ec) < 150 or raw_t.empty or len(raw_t) < 150:
+        with diag_lock: diag_counts["no_data"] += 1
+        return
+
+    df_entry   = resample_ohlcv(raw_ec, entry_min)
     df_confirm = resample_ohlcv(raw_ec, confirm_min)
-    df_third = resample_ohlcv(raw_t, third_min)
+    df_third   = resample_ohlcv(raw_t,  third_min)
 
-    if any(d.empty or len(d) < 35 for d in [df_entry, df_confirm, df_third]): return
+    if any(d.empty or len(d) < 35 for d in [df_entry, df_confirm, df_third]):
+        with diag_lock: diag_counts["no_data"] += 1
+        return
 
-    if not check_macd_green(df_confirm) or not check_donchian(df_confirm, direction="green"): return
-    if not check_smi_oversold(df_entry) or not check_macd_entry(df_entry, entry_min) or not check_donchian(df_entry, direction="green") or not check_ema50_below(df_entry): return
-    if not check_rsi_stoch(df_third) or not check_donchian(df_third, direction="red"): return
+    if not check_macd_green(df_confirm):
+        with diag_lock: diag_counts["macd_confirm"] += 1
+        return
+
+    if not check_donchian(df_confirm, direction="green"):
+        with diag_lock: diag_counts["donchian_confirm"] += 1
+        return
+
+    if not check_smi_oversold(df_entry):
+        with diag_lock: diag_counts["smi_oversold"] += 1
+        return
+
+    if not check_macd_entry(df_entry, entry_min):
+        with diag_lock: diag_counts["macd_entry"] += 1
+        return
+
+    if not check_donchian(df_entry, direction="green"):
+        with diag_lock: diag_counts["donchian_entry"] += 1
+        return
+
+    if not check_ema50_below(df_entry):
+        with diag_lock: diag_counts["ema50"] += 1
+        return
+
+    if not check_rsi_stoch(df_third):
+        with diag_lock: diag_counts["rsi_stoch"] += 1
+        return
+
+    if not check_donchian(df_third, direction="red"):
+        with diag_lock: diag_counts["donchian_third"] += 1
+        return
+
+    with diag_lock: diag_counts["passed"] += 1
 
     last_ts = df_entry["ts"].iloc[-1].strftime("%Y%m%d%H%M") if "ts" in df_entry.columns else "x"
     key = f"{symbol}_{entry_min}_{last_ts}"
@@ -339,7 +425,6 @@ def get_next_close(tf_minutes: int) -> datetime:
     return epoch + timedelta(minutes=((total // tf_minutes) + 1) * tf_minutes)
 
 def candle_watcher(entry_min: int, confirm_min: int, third_min: int, ec_api: str, t_api: str):
-    label = f"{entry_min}m/{confirm_min}m/{third_min}m"
     while True:
         nxt = get_next_close(entry_min)
         wait = (nxt - datetime.now(timezone.utc)).total_seconds()
@@ -348,7 +433,7 @@ def candle_watcher(entry_min: int, confirm_min: int, third_min: int, ec_api: str
         if not prefetch_done.is_set(): continue
         with symbols_cache_lock: syms = list(symbols_cache)
         if not syms: continue
-        with ThreadPoolExecutor(max_workers=4) as ex: # تقليل الخيوط المتوازية لتفادي الحظر
+        with ThreadPoolExecutor(max_workers=4) as ex:
             ex.map(lambda s: scan_symbol(s, entry_min, confirm_min, third_min, ec_api, t_api), syms)
 
 def update_symbols_loop():
@@ -374,28 +459,28 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"OK")
-    def log_message(self, *_) : pass
+    def log_message(self, *_): pass
 
 def main():
     log.info("🚀 Tripling Strategy Bot — Starting")
     threading.Thread(target=update_symbols_loop, daemon=True).start()
-    
+
     while not symbols_cache:
         time.sleep(1)
-        
+
     threading.Thread(target=poll_telegram_commands, daemon=True).start()
     threading.Thread(target=cache_updater_1m, daemon=True).start()
     threading.Thread(target=cache_updater_60m, daemon=True).start()
+    threading.Thread(target=send_diag_report, daemon=True).start()  # ✅ تقرير التشخيص
     threading.Thread(target=lambda: HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever(), daemon=True).start()
 
-    # تعديل جوهري: انتظر انتهاء الـ Prefetch تماماً لضمان عدم حظر الحساب وسلامة البيانات
-    log.info("⏳ جاري جلب البيانات التاريخية، يرجى الانتظار لتجنب حظر الـ IP...")
-    prefetch_done.wait() 
+    log.info("⏳ جاري جلب البيانات التاريخية...")
+    prefetch_done.wait()
 
     for entry_min, confirm_min, third_min, ec_api, t_api in TRIPLING_PAIRS:
         threading.Thread(target=candle_watcher, args=(entry_min, confirm_min, third_min, ec_api, t_api), daemon=True).start()
 
-    log.info("✅ جميع الواتشرز تعمل الآن بنجاح وبشكل آمن.")
+    log.info("✅ جميع الواتشرز تعمل.")
     while True: time.sleep(60)
 
 if __name__ == "__main__":
