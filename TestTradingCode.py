@@ -13,8 +13,6 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-# ─── الإعدادات ──────────────────────────────────────────────────────────────
-
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "8298845980:AAFrhgrdngO6b1vV9poLyw7c_yT0afTkMg4")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "-1003853071475")
 TOP_SYMBOLS_LIMIT = 70
@@ -40,8 +38,6 @@ API_FETCH_CANDLES = {"1m": 7_680, "60m": 1_500}
 CACHE_MAX_CANDLES = {"1m": 8_500, "60m": 2_200}
 EPOCH = pd.Timestamp("1970-01-01", tz="UTC")
 
-# ─── حالة البوت ──────────────────────────────────────────────────────────────
-
 alerted_keys      = {}
 alerted_keys_lock = threading.Lock()
 trades_history    = deque(maxlen=2000)
@@ -51,8 +47,6 @@ symbols_cache_lock= threading.Lock()
 ohlcv_cache       = {}
 ohlcv_cache_lock  = threading.Lock()
 prefetch_done     = threading.Event()
-
-# ─── عدادات التشخيص ──────────────────────────────────────────────────────────
 
 diag_counts = {
     "total"           : 0,
@@ -69,6 +63,9 @@ diag_counts = {
 }
 diag_lock = threading.Lock()
 
+# ─── عداد تشخيص الكاش ────────────────────────────────────────────────────────
+cache_diag_logged = threading.Event()  # نسجل مرة واحدة بس
+
 _local = threading.local()
 
 def get_session() -> requests.Session:
@@ -77,8 +74,6 @@ def get_session() -> requests.Session:
         s.headers.update({"Accept-Encoding": "gzip", "User-Agent": "Mozilla/5.0"})
         _local.s = s
     return _local.s
-
-# ─── ✅ إصلاح 1: حذف الـ Webhook عند البداية ─────────────────────────────────
 
 def delete_webhook():
     try:
@@ -109,8 +104,6 @@ def save_signal(symbol, price, entry_min, confirm_min, third_min):
             "price"    : price,
             "timeframe": f"{entry_min}m/{confirm_min}m/{third_min}m",
         })
-
-# ─── ✅ إصلاح 2: send_telegram تقبل chat_id اختياري ─────────────────────────
 
 def send_telegram(msg: str, chat_id: str = None) -> bool:
     target = chat_id or TELEGRAM_CHAT_ID
@@ -148,8 +141,6 @@ def get_report(period="today") -> str:
     for t in rows:
         lines.append(f"✅ {t['symbol']} | {t['timeframe']} | {t['price']:.4g} | {t['time'].strftime('%H:%M')}")
     return "\n".join(lines)
-
-# ─── ✅ إصلاح 3: poll_telegram_commands مع logging وchat_id ديناميكي ─────────
 
 def poll_telegram_commands():
     last_id = 0
@@ -196,6 +187,14 @@ def poll_telegram_commands():
                         f"🤖 البوت يعمل\n📊 إجمالي الإشارات: {cnt}\n🔑 نشطة: {active}\n💾 كاش: {len(ohlcv_cache)}",
                         chat_id
                     )
+                elif txt == "/cache":
+                    # ✅ أمر جديد لفحص حجم الكاش الفعلي
+                    with ohlcv_cache_lock:
+                        sample = list(ohlcv_cache.items())[:5]
+                    lines = ["🔬 <b>فحص الكاش (أول 5 عملات):</b>"]
+                    for (sym, tf), df in sample:
+                        lines.append(f"• {sym} [{tf}]: {len(df)} شمعة")
+                    send_telegram("\n".join(lines), chat_id)
                 elif txt == "/help":
                     send_telegram(
                         "📋 <b>الأوامر المتاحة:</b>\n"
@@ -203,6 +202,7 @@ def poll_telegram_commands():
                         "2️⃣  <code>2</code> — إشارات أمس\n"
                         "3️⃣  <code>3</code> — آخر 7 أيام\n"
                         "📊  <code>/status</code> — حالة البوت\n"
+                        "🔬  <code>/cache</code> — فحص حجم الكاش الفعلي\n"
                         "🔍  <code>/سبب</code> — ليش ما في إشارات (تشخيص)\n"
                         "📋  <code>/help</code> — قائمة الأوامر",
                         chat_id
@@ -252,7 +252,7 @@ def get_ohlcv_full(symbol: str, tf: str, target: int) -> pd.DataFrame:
             if len(resp) < limit:
                 break
             end_ms = int(resp[0][0]) - 1
-            time.sleep(0.1)
+            time.sleep(0.12)
         except Exception as e:
             log.error(f"full fetch error {symbol}: {e}")
             time.sleep(2)
@@ -289,14 +289,28 @@ def prefetch_all(symbols: list):
                 df = get_ohlcv_full(sym, tf, target=n)
                 if not df.empty:
                     cache_merge(sym, tf, df)
-                time.sleep(0.1)
+                    # ✅ تشخيص: سجّل أول عملة لكل timeframe
+                    if i == 0:
+                        log.info(f"🔬 تشخيص أول عملة: {sym} [{tf}] = {len(df)} شمعة")
+                time.sleep(0.12)
             except Exception as e:
                 log.error(f"prefetch {sym} {tf}: {e}")
         if (i + 1) % 10 == 0 or i == total - 1:
             log.info(f"📦 جاري التحميل: {i+1}/{total}")
+
+    # ✅ تشخيص: أرسل تقرير الكاش بعد اكتمال التحميل
+    with ohlcv_cache_lock:
+        sample = list(ohlcv_cache.items())[:3]
+    diag_lines = ["🔬 <b>تشخيص الكاش بعد التحميل:</b>"]
+    for (sym, tf), df in sample:
+        diag_lines.append(f"• {sym} [{tf}]: {len(df)} شمعة")
+
     prefetch_done.set()
     log.info("✅ اكتمل التحميل التاريخي بالكامل.")
-    send_telegram(f"✅ <b>التحميل التاريخي اكتمل</b>\n📈 عملات: {total}")
+    send_telegram(
+        f"✅ <b>التحميل التاريخي اكتمل</b>\n📈 عملات: {total}\n\n" +
+        "\n".join(diag_lines)
+    )
 
 def _update_batch(symbols, tf, limit):
     for sym in symbols:
@@ -304,7 +318,7 @@ def _update_batch(symbols, tf, limit):
             df = get_ohlcv(sym, tf, limit=limit)
             if not df.empty:
                 cache_merge(sym, tf, df)
-            time.sleep(0.1)
+            time.sleep(0.12)
         except Exception as e:
             log.error(f"update {sym} {tf}: {e}")
 
@@ -340,8 +354,6 @@ def resample_ohlcv(df: pd.DataFrame, minutes: int) -> pd.DataFrame:
     except Exception as e:
         log.error(f"resample error: {e}")
         return pd.DataFrame()
-
-# ─── الحسابات الفنية ──────────────────────────────────────────────────────────
 
 def calc_smi(high, low, close, k=10, d=3, ema=10, smooth=1):
     hh  = high.rolling(k).max()
@@ -436,8 +448,6 @@ def check_rsi_stoch(df: pd.DataFrame, lookback=5) -> bool:
     d     = k.rolling(3).mean()
     return any(k.iloc[i-1] < 20 and k.iloc[i] >= 20 for i in range(-lookback, 0))
 
-# ─── تقرير التشخيص ──────────────────────────────────────────────────────────
-
 DIAG_LABELS = {
     "no_data"         : "بيانات ناقصة",
     "macd_confirm"    : "MACD Confirm مش أخضر",
@@ -487,16 +497,19 @@ def send_diag_report():
         time.sleep(3600)
         send_telegram(build_diag_msg(reset=True))
 
-# ─── فحص العملات ─────────────────────────────────────────────────────────────
-
 def scan_symbol(symbol: str, entry_min: int, confirm_min: int, third_min: int, ec_api: str, t_api: str):
     raw_ec = get_cached(symbol, ec_api)
     raw_t  = get_cached(symbol, t_api)
 
+    # ✅ تشخيص: سجّل حجم الكاش لأول عملة فقط (مرة واحدة)
+    if not cache_diag_logged.is_set():
+        log.info(f"🔍 تشخيص كاش | {symbol} | ec[{ec_api}]={len(raw_ec)} | t[{t_api}]={len(raw_t)}")
+        cache_diag_logged.set()
+
     with diag_lock:
         diag_counts["total"] += 1
 
-    if raw_ec.empty or len(raw_ec) < 150 or raw_t.empty or len(raw_t) < 150:
+    if raw_ec.empty or len(raw_ec) < 50 or raw_t.empty or len(raw_t) < 50:
         with diag_lock:
             diag_counts["no_data"] += 1
         return
@@ -505,7 +518,7 @@ def scan_symbol(symbol: str, entry_min: int, confirm_min: int, third_min: int, e
     df_confirm = resample_ohlcv(raw_ec, confirm_min)
     df_third   = resample_ohlcv(raw_t,  third_min)
 
-    if any(d.empty or len(d) < 35 for d in [df_entry, df_confirm, df_third]):
+    if any(d.empty or len(d) < 25 for d in [df_entry, df_confirm, df_third]):
         with diag_lock:
             diag_counts["no_data"] += 1
         return
@@ -578,6 +591,8 @@ def candle_watcher(entry_min: int, confirm_min: int, third_min: int, ec_api: str
             syms = list(symbols_cache)
         if not syms:
             continue
+        # ✅ إعادة تفعيل التشخيص في كل دورة فحص
+        cache_diag_logged.clear()
         fn = partial(scan_symbol,
                      entry_min=entry_min,
                      confirm_min=confirm_min,
