@@ -396,15 +396,30 @@ def check_ema50_below(df: pd.DataFrame) -> bool:
     ema = df["close"].ewm(span=50, adjust=False).mean()
     return bool(df["close"].iloc[-1] < ema.iloc[-1])
 
+def wilder_rma(series: pd.Series, period: int) -> pd.Series:
+    """Wilder's RMA — نفس طريقة TradingView"""
+    result = series.copy() * 0.0
+    result.iloc[period - 1] = series.iloc[:period].mean()
+    alpha = 1 / period
+    for i in range(period, len(series)):
+        result.iloc[i] = result.iloc[i - 1] * (1 - alpha) + series.iloc[i] * alpha
+    return result
+
+def calc_rsi_tv(close: pd.Series, period: int = 14) -> pd.Series:
+    """RSI بطريقة TradingView (Wilder's RMA)"""
+    delta = close.diff()
+    gain  = delta.clip(lower=0)
+    loss  = (-delta.clip(upper=0))
+    avg_g = wilder_rma(gain, period)
+    avg_l = wilder_rma(loss, period)
+    rs    = avg_g / (avg_l + 1e-10)
+    return 100 - (100 / (1 + rs))
+
 def check_rsi_stoch(df: pd.DataFrame, lookback=5) -> bool:
     if len(df) < 50:
         return False
     close, high, low = df["close"], df["high"], df["low"]
-    delta  = close.diff()
-    alpha  = 1 / 14
-    rma_g  = delta.clip(lower=0).ewm(alpha=alpha, adjust=False).mean()
-    rma_l  = (-delta.clip(upper=0)).ewm(alpha=alpha, adjust=False).mean()
-    rsi    = 100 - (100 / (1 + rma_g / (rma_l + 1e-10)))
+    rsi    = calc_rsi_tv(close, period=14)
     rsi_ma = rsi.rolling(14).mean()
     if rsi.iloc[-20:].min() > 35:
         return False
