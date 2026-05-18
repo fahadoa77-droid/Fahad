@@ -731,11 +731,16 @@ def update_symbols_loop():
     first = True
     while True:
         try:
-            resp = get_session().get(
+            log.info(f"🔄 جاري جلب قائمة العملات من Binance: {BINANCE_BASE}")
+            r = get_session().get(
                 f"{BINANCE_BASE}/api/v3/ticker/24hr",
-                timeout=15
-            ).json()
-            if isinstance(resp, list):
+                timeout=20,
+            )
+            log.info(f"📡 Binance status: {r.status_code}")
+            resp = r.json()
+            log.info(f"📦 Binance response type: {type(resp).__name__} | len: {len(resp) if isinstance(resp, list) else 'N/A'} | sample: {str(resp)[:200]}")
+
+            if isinstance(resp, list) and resp:
                 top = sorted(
                     [s for s in resp if s["symbol"].endswith("USDT")],
                     key=lambda x: float(x.get("quoteVolume", 0)),
@@ -745,12 +750,42 @@ def update_symbols_loop():
                 with symbols_cache_lock:
                     symbols_cache.clear()
                     symbols_cache.extend(new_syms)
-                log.info(f"✅ تحديث العملات: {len(new_syms)} عملة من Binance")
+                log.info(f"✅ تحديث العملات: {len(new_syms)} عملة — أول 5: {new_syms[:5]}")
                 if first:
                     first = False
                     threading.Thread(target=prefetch_all, args=(list(new_syms),), daemon=True).start()
+            else:
+                log.error(f"❌ Binance رد غير متوقع: {str(resp)[:300]}")
+                # fallback: استخدم عملات ثابتة لتشغيل البوت
+                if first:
+                    fallback = [
+                        "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT",
+                        "DOGEUSDT","ADAUSDT","AVAXUSDT","DOTUSDT","MATICUSDT",
+                        "LINKUSDT","UNIUSDT","LTCUSDT","ATOMUSDT","NEARUSDT",
+                    ]
+                    with symbols_cache_lock:
+                        symbols_cache.clear()
+                        symbols_cache.extend(fallback)
+                    log.warning(f"⚠️ استخدام fallback: {len(fallback)} عملة")
+                    first = False
+                    threading.Thread(target=prefetch_all, args=(list(fallback),), daemon=True).start()
+
         except Exception as e:
-            log.error(f"Symbols loop error: {e}")
+            log.error(f"❌ Symbols loop error: {e}")
+            # fallback عند الخطأ الكامل
+            if first:
+                fallback = [
+                    "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT",
+                    "DOGEUSDT","ADAUSDT","AVAXUSDT","DOTUSDT","MATICUSDT",
+                    "LINKUSDT","UNIUSDT","LTCUSDT","ATOMUSDT","NEARUSDT",
+                ]
+                with symbols_cache_lock:
+                    symbols_cache.clear()
+                    symbols_cache.extend(fallback)
+                log.warning(f"⚠️ fallback بعد خطأ: {len(fallback)} عملة")
+                first = False
+                threading.Thread(target=prefetch_all, args=(list(fallback),), daemon=True).start()
+
         time.sleep(3600)
 
 class HealthHandler(BaseHTTPRequestHandler):
