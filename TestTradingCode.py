@@ -34,7 +34,7 @@ TRIPLING_PAIRS = [
     (180, 540, 60, "60m","60m"),
 ]
 
-# ✅ مرحلة أولى سريعة → الإشارات تبدأ خلال دقائق
+# ✅ مرحلة أولى سريعة → الإشارات تبدأ بعد اكتمال كل العملات
 FAST_FETCH_CANDLES = {"1m": 600, "60m": 200}
 # ✅ مرحلة ثانية كاملة → في الخلفية
 API_FETCH_CANDLES  = {"1m": 7_680, "60m": 1_500}
@@ -348,27 +348,46 @@ def prefetch_all(symbols: list):
     # ── المرحلة الأولى: سريعة ────────────────────────────────────────
     log.info(f"⚡ المرحلة الأولى (سريعة): {total} عملة…")
     fast_success = 0
+    fast_failed  = 0
+
     for i, sym in enumerate(symbols):
         for tf, n in FAST_FETCH_CANDLES.items():
-            try:
-                df = get_ohlcv(sym, tf, limit=n)
-                if not df.empty:
-                    cache_merge(sym, tf, df)
-                    fast_success += 1
-                else:
-                    log.warning(f"⚠️ سريع فارغ: {sym} [{tf}]")
-                time.sleep(0.1)
-            except Exception as e:
-                log.error(f"fast prefetch {sym} {tf}: {e}")
-        if (i + 1) % 20 == 0 or i == total - 1:
-            log.info(f"⚡ سريع: {i+1}/{total}")
+            fetched = False
+            for attempt in range(3):          # ✅ retry لكل عملة
+                try:
+                    df = get_ohlcv(sym, tf, limit=n)
+                    if not df.empty:
+                        cache_merge(sym, tf, df)
+                        fast_success += 1
+                        fetched = True
+                        break
+                    else:
+                        log.warning(f"⚠️ سريع فارغ: {sym} [{tf}] (محاولة {attempt+1})")
+                        time.sleep(0.3 * (attempt + 1))
+                except Exception as e:
+                    log.error(f"fast prefetch {sym} {tf} (محاولة {attempt+1}): {e}")
+                    time.sleep(1 * (attempt + 1))
+            if not fetched:
+                fast_failed += 1
+                log.warning(f"❌ فشل نهائي (سريع): {sym} [{tf}]")
 
+            time.sleep(0.2)          # ✅ زيادة من 0.1 إلى 0.2 لتجنب rate limit
+
+        if (i + 1) % 20 == 0 or i == total - 1:
+            log.info(f"⚡ سريع: {i+1}/{total} | نجح: {fast_success} | فشل: {fast_failed}")
+
+    # ── التحقق من الكاش بعد اكتمال كل العملات ──
     with ohlcv_cache_lock:
         fast_cache_size = len(ohlcv_cache)
+        # عدد العملات التي لديها بيانات 1m
+        filled_1m = sum(
+            1 for sym in symbols
+            if (sym, "1m") in ohlcv_cache and not ohlcv_cache[(sym, "1m")].empty
+        )
 
     # ✅ التحقق قبل تفعيل fast_prefetch_done
     if fast_cache_size == 0:
-        log.error("❌ الكاش السريع فارغ! MEXC API فشل.")
+        log.error("❌ الكاش السريع فارغ تماماً! MEXC API فشل.")
         send_telegram(
             "❌ <b>فشل التحميل السريع!</b>\n"
             "MEXC API لا يستجيب.\n"
@@ -377,12 +396,16 @@ def prefetch_all(symbols: list):
         )
         return
 
+    # ✅ fast_prefetch_done يُفعَّل فقط بعد اكتمال كل العملات
     fast_prefetch_done.set()
-    log.info(f"✅ المرحلة الأولى اكتملت | كاش: {fast_cache_size} مفتاح")
+    log.info(
+        f"✅ المرحلة الأولى اكتملت | كاش: {fast_cache_size} مفتاح | "
+        f"مكتملة 1m: {filled_1m}/{total} | فشل: {fast_failed}"
+    )
     send_telegram(
         f"⚡ <b>التحميل السريع اكتمل — الإشارات بدأت!</b>\n"
-        f"📈 عملات: {total} | 💾 مفاتيح: {fast_cache_size}\n"
-        f"📦 جاري تحميل البيانات الكاملة في الخلفية..."
+        f"📈 عملات: {total} | ✅ مكتملة: {filled_1m} | 💾 مفاتيح: {fast_cache_size}\n"
+        f"❌ فشل: {fast_failed} | 📦 جاري تحميل البيانات الكاملة في الخلفية..."
     )
 
     # ── المرحلة الثانية: كاملة تاريخية ──────────────────────────────
@@ -614,6 +637,8 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
     if raw_ec.empty or len(raw_ec) < 50 or raw_t.empty or len(raw_t) < 50:
         with diag_lock:
             diag_counts["no_data"] += 1
+        # ✅ تسجيل تفصيلي لمعرفة أي عملات تفشل
+        log.debug(f"no_data: {symbol} | ec[{ec_api}]={len(raw_ec)} | t[{t_api}]={len(raw_t)}")
         return
 
     df_entry   = resample_ohlcv(raw_ec, entry_min)
@@ -680,7 +705,7 @@ def candle_watcher(entry_min, confirm_min, third_min, ec_api, t_api):
         wait = (nxt - datetime.now(timezone.utc)).total_seconds()
         time.sleep(max(wait, 0) + 2.0)
         cleanup_alerted_keys()
-        # ✅ يكفي التحميل السريع لبدء الفحص
+        # ✅ ينتظر حتى اكتمال التحميل السريع لكل العملات
         if not fast_prefetch_done.is_set():
             continue
         with symbols_cache_lock:
@@ -742,8 +767,8 @@ def main():
         daemon=True,
     ).start()
 
-    log.info("⏳ انتظار التحميل السريع…")
-    fast_prefetch_done.wait()  # ✅ ينتظر السريع فقط (دقائق لا ساعة)
+    log.info("⏳ انتظار اكتمال التحميل السريع لكل العملات…")
+    fast_prefetch_done.wait()  # ✅ ينتظر اكتمال التحميل السريع لكل العملات
     log.info("✅ بدء الواتشرز")
 
     for entry_min, confirm_min, third_min, ec_api, t_api in TRIPLING_PAIRS:
