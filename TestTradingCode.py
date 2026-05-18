@@ -19,12 +19,11 @@ TOP_SYMBOLS_LIMIT = 70
 PORT = int(os.environ.get("PORT", "8080"))
 ALERT_EXPIRY_HOURS = 4
 
-# ── Binance API Base URL ──────────────────────────────────────────────────────
-# إذا السيرفر في US استخدم: https://api1.binance.com
-BINANCE_BASE = os.environ.get("BINANCE_BASE", "https://api.binance.com")
-
-# Binance لا يدعم "60m" — يجب تحويله إلى "1h"
-TF_MAP = {"1m": "1m", "60m": "1h"}
+# ── KuCoin API — بدون قيود جغرافية ──────────────────────────────────────────
+KUCOIN_BASE = "https://api.kucoin.com"
+# KuCoin يستخدم صيغة BTC-USDT بدل BTCUSDT
+# TF: 1min, 3min, 5min, 15min, 30min, 1hour, 2hour, 4hour, 6hour, 8hour, 12hour, 1day
+TF_MAP = {"1m": "1min", "60m": "1hour"}
 
 TRIPLING_PAIRS = [
     (  9,  27,  3, "1m", "1m"),
@@ -50,7 +49,7 @@ alerted_keys       = {}
 alerted_keys_lock  = threading.Lock()
 trades_history     = deque(maxlen=2000)
 trades_lock        = threading.Lock()
-symbols_cache      = []
+symbols_cache      = []          # يخزن صيغة BTCUSDT داخلياً
 symbols_cache_lock = threading.Lock()
 ohlcv_cache        = {}
 ohlcv_cache_lock   = threading.Lock()
@@ -67,6 +66,19 @@ diag_counts = {
 diag_lock = threading.Lock()
 cache_diag_logged = threading.Event()
 _local = threading.local()
+
+# ── KuCoin helpers ─────────────────────────────────────────────────────────────
+def to_kucoin_symbol(symbol: str) -> str:
+    """BTCUSDT → BTC-USDT"""
+    if "-" in symbol:
+        return symbol
+    if symbol.endswith("USDT"):
+        return symbol[:-4] + "-USDT"
+    return symbol
+
+def from_kucoin_symbol(symbol: str) -> str:
+    """BTC-USDT → BTCUSDT"""
+    return symbol.replace("-", "")
 
 def get_session() -> requests.Session:
     if not hasattr(_local, "s"):
@@ -181,11 +193,11 @@ def poll_telegram_commands():
                     else:
                         send_telegram(build_diag_msg(reset=False), chat_id)
                 elif txt == "/status":
-                    with trades_lock:       cnt  = len(trades_history)
+                    with trades_lock:       cnt    = len(trades_history)
                     with alerted_keys_lock: active = len(alerted_keys)
-                    with ohlcv_cache_lock:  keys = len(ohlcv_cache)
+                    with ohlcv_cache_lock:  keys   = len(ohlcv_cache)
                     send_telegram(
-                        f"🤖 البوت يعمل\n"
+                        f"🤖 البوت يعمل — KuCoin API\n"
                         f"📊 إجمالي الإشارات: {cnt}\n"
                         f"🔑 تنبيهات نشطة: {active}\n"
                         f"💾 الكاش: {keys} مفتاح\n"
@@ -202,7 +214,7 @@ def poll_telegram_commands():
                         lines.append(f"• {sym} [{tf}]: {len(df)} شمعة")
                     send_telegram("\n".join(lines), chat_id)
                 elif txt == "/fetchtest":
-                    send_telegram("🔄 جاري اختبار Binance API...", chat_id)
+                    send_telegram("🔄 جاري اختبار KuCoin API...", chat_id)
                     results = []
                     for tf in ["1m", "60m"]:
                         df = get_ohlcv("BTCUSDT", tf, limit=10)
@@ -218,7 +230,7 @@ def poll_telegram_commands():
                     results.append(f"\n💾 الكاش: {cache_keys} مفتاح")
                     results.append(f"⚡ سريع: {'✅' if fast_prefetch_done.is_set() else '⏳'}")
                     results.append(f"📦 كامل: {'✅' if prefetch_done.is_set() else '⏳'}")
-                    send_telegram("🧪 <b>نتيجة اختبار Binance:</b>\n" + "\n".join(results), chat_id)
+                    send_telegram("🧪 <b>نتيجة اختبار KuCoin:</b>\n" + "\n".join(results), chat_id)
                 elif txt == "/reload":
                     send_telegram("🔄 جاري إعادة تحميل الكاش...", chat_id)
                     with symbols_cache_lock:
@@ -238,7 +250,7 @@ def poll_telegram_commands():
                         "3️⃣  <code>3</code> — آخر 7 أيام\n"
                         "📊  <code>/status</code> — حالة البوت والكاش\n"
                         "🔬  <code>/cache</code> — فحص الكاش\n"
-                        "🧪  <code>/fetchtest</code> — اختبار اتصال Binance\n"
+                        "🧪  <code>/fetchtest</code> — اختبار اتصال KuCoin\n"
                         "🔄  <code>/reload</code> — إعادة تحميل الكاش\n"
                         "🔍  <code>/سبب</code> — تشخيص غياب الإشارات\n"
                         "📋  <code>/help</code> — قائمة الأوامر",
@@ -251,73 +263,80 @@ def poll_telegram_commands():
             log.error(f"❌ Polling error: {e}")
             time.sleep(10)
 
+# ── KuCoin klines parser ────────────────────────────────────────────────────────
+# KuCoin يرجع: [[timestamp_sec, open, close, high, low, volume, turnover], ...]
+# مرتبة من الأحدث للأقدم — نعكسها
 def _parse_klines(resp) -> pd.DataFrame:
-    """
-    Binance klines format:
-    [open_time, open, high, low, close, volume, close_time, quote_asset_volume, ...]
-    نفس تنسيق MEXC تقريباً — العمود الأول هو open_time بالـ ms
-    """
-    df = pd.DataFrame(
-        resp,
-        columns=["ts","open","high","low","close","vol","close_ts","quote_vol",
-                 "trades","taker_base","taker_quote","ignore"],
-    )
+    df = pd.DataFrame(resp, columns=["ts","open","close","high","low","vol","turnover"])
     for c in ["open","high","low","close","vol"]:
         df[c] = df[c].astype(float)
-    df["ts"] = pd.to_datetime(df["ts"].astype(int), unit="ms", utc=True)
+    # KuCoin timestamp بالثواني
+    df["ts"] = pd.to_datetime(df["ts"].astype(int), unit="s", utc=True)
+    df = df.sort_values("ts").reset_index(drop=True)
     return df[["ts","open","high","low","close","vol"]]
 
 def get_ohlcv(symbol: str, tf: str, limit: int = 500) -> pd.DataFrame:
-    interval = TF_MAP.get(tf, tf)   # تحويل 60m → 1h
+    kc_sym  = to_kucoin_symbol(symbol)
+    kc_tf   = TF_MAP.get(tf, "1min")
+    # KuCoin: startAt و endAt بالثواني — نجلب آخر limit شمعة
+    end_sec = int(time.time())
+    tf_sec  = 60 if tf == "1m" else 3600
+    start_sec = end_sec - limit * tf_sec
     try:
         resp = get_session().get(
-            f"{BINANCE_BASE}/api/v3/klines",
-            params={"symbol": symbol, "interval": interval, "limit": min(limit, 1000)},
+            f"{KUCOIN_BASE}/api/v1/market/candles",
+            params={"symbol": kc_sym, "type": kc_tf,
+                    "startAt": start_sec, "endAt": end_sec},
             timeout=10,
         ).json()
-        if isinstance(resp, list) and resp:
-            return _parse_klines(resp)
+        data = resp.get("data", [])
+        if data:
+            return _parse_klines(data)
         log.warning(f"⚠️ رد غير صالح {symbol}/{tf}: {str(resp)[:120]}")
     except Exception as e:
         log.error(f"get_ohlcv {symbol} {tf}: {e}")
     return pd.DataFrame()
 
 def get_ohlcv_full(symbol: str, tf: str, target: int) -> pd.DataFrame:
-    interval = TF_MAP.get(tf, tf)   # تحويل 60m → 1h
+    kc_sym  = to_kucoin_symbol(symbol)
+    kc_tf   = TF_MAP.get(tf, "1min")
+    tf_sec  = 60 if tf == "1m" else 3600
+    # KuCoin يرجع max 1500 شمعة لكل طلب
+    KUCOIN_MAX = 1500
     all_dfs  = []
-    end_ms   = None
+    end_sec  = int(time.time())
     fetched  = 0
     retries  = 0
 
     while fetched < target:
-        limit  = min(1000, target - fetched)
-        params = {"symbol": symbol, "interval": interval, "limit": limit}
-        if end_ms is not None:
-            params["endTime"] = end_ms
+        batch     = min(KUCOIN_MAX, target - fetched)
+        start_sec = end_sec - batch * tf_sec
         try:
             resp = get_session().get(
-                f"{BINANCE_BASE}/api/v3/klines",
-                params=params,
+                f"{KUCOIN_BASE}/api/v1/market/candles",
+                params={"symbol": kc_sym, "type": kc_tf,
+                        "startAt": start_sec, "endAt": end_sec},
                 timeout=15,
             ).json()
+            data = resp.get("data", [])
 
-            if not isinstance(resp, list) or not resp:
-                log.warning(f"⚠️ رد غير صالح {symbol}/{tf}: {str(resp)[:120]}")
+            if not data:
+                log.warning(f"⚠️ فارغ {symbol}/{tf}: {str(resp)[:120]}")
                 retries += 1
                 if retries >= 3:
                     break
                 time.sleep(2 ** retries)
                 continue
 
-            all_dfs.insert(0, _parse_klines(resp))
-            fetched += len(resp)
-            retries = 0
+            df = _parse_klines(data)
+            all_dfs.insert(0, df)
+            fetched  += len(df)
+            retries   = 0
+            end_sec   = start_sec - 1   # نتحرك للخلف
 
-            if len(resp) < limit:
+            if len(df) < batch:
                 break
-            # Binance: العمود الأول في كل صف هو open_time
-            end_ms = int(resp[0][0]) - 1
-            time.sleep(0.12)   # Binance rate limit أريح من MEXC
+            time.sleep(0.2)
 
         except requests.exceptions.Timeout:
             retries += 1
@@ -358,7 +377,7 @@ def get_cached(symbol: str, tf: str) -> pd.DataFrame:
 def prefetch_all(symbols: list):
     total = len(symbols)
 
-    log.info(f"⚡ المرحلة الأولى (سريعة): {total} عملة | 1m→3500 شمعة | 60m→250 شمعة")
+    log.info(f"⚡ المرحلة الأولى (سريعة): {total} عملة | 1m→3500 | 60m→250")
     fast_success = 0
     fast_failed  = 0
 
@@ -384,7 +403,7 @@ def prefetch_all(symbols: list):
                 fast_failed += 1
                 log.warning(f"❌ فشل نهائي (سريع): {sym} [{tf}]")
 
-            time.sleep(0.15)
+            time.sleep(0.2)
 
         if (i + 1) % 10 == 0 or i == total - 1:
             log.info(f"⚡ سريع: {i+1}/{total} | نجح: {fast_success} | فشل: {fast_failed}")
@@ -397,24 +416,21 @@ def prefetch_all(symbols: list):
         )
 
     if fast_cache_size == 0:
-        log.error("❌ الكاش السريع فارغ تماماً! Binance API فشل.")
+        log.error("❌ الكاش السريع فارغ! KuCoin API فشل.")
         send_telegram(
             "❌ <b>فشل التحميل السريع!</b>\n"
-            "Binance API لا يستجيب.\n"
+            "KuCoin API لا يستجيب.\n"
             "💡 استخدم /fetchtest للتشخيص\n"
             "🔄 أرسل /reload للمحاولة مجدداً"
         )
         return
 
     fast_prefetch_done.set()
-    log.info(
-        f"✅ المرحلة الأولى اكتملت | كاش: {fast_cache_size} مفتاح | "
-        f"مكتملة 1m: {filled_1m}/{total} | فشل: {fast_failed}"
-    )
+    log.info(f"✅ المرحلة الأولى اكتملت | كاش: {fast_cache_size} | مكتملة 1m: {filled_1m}/{total}")
     send_telegram(
         f"⚡ <b>التحميل السريع اكتمل — الإشارات بدأت!</b>\n"
         f"📈 عملات: {total} | ✅ مكتملة: {filled_1m} | 💾 مفاتيح: {fast_cache_size}\n"
-        f"❌ فشل: {fast_failed} | 📦 جاري تحميل البيانات الكاملة في الخلفية..."
+        f"❌ فشل: {fast_failed} | 📦 جاري تحميل البيانات الكاملة..."
     )
 
     log.info(f"📦 المرحلة الثانية (كاملة): {total} عملة…")
@@ -428,7 +444,7 @@ def prefetch_all(symbols: list):
                     full_success += 1
                 else:
                     log.warning(f"⚠️ كامل فارغ: {sym} [{tf}]")
-                time.sleep(0.12)
+                time.sleep(0.2)
             except Exception as e:
                 log.error(f"full prefetch {sym} {tf}: {e}")
         if (i + 1) % 10 == 0 or i == total - 1:
@@ -457,7 +473,7 @@ def _update_batch(symbols, tf, limit):
             df = get_ohlcv(sym, tf, limit=limit)
             if not df.empty:
                 cache_merge(sym, tf, df)
-            time.sleep(0.10)
+            time.sleep(0.15)
         except Exception as e:
             log.error(f"update {sym} {tf}: {e}")
 
@@ -550,12 +566,7 @@ def check_ema50_below(df: pd.DataFrame) -> bool:
     return bool(df["close"].iloc[-1] < ema.iloc[-1])
 
 def wilder_rma(series: pd.Series, period: int) -> pd.Series:
-    result = series.copy() * 0.0
-    result.iloc[period - 1] = series.iloc[:period].mean()
-    alpha = 1 / period
-    for i in range(period, len(series)):
-        result.iloc[i] = result.iloc[i - 1] * (1 - alpha) + series.iloc[i] * alpha
-    return result
+    return series.ewm(alpha=1/period, adjust=False).mean()
 
 def calc_rsi_tv(close: pd.Series, period: int = 14) -> pd.Series:
     delta = close.diff()
@@ -731,22 +742,23 @@ def update_symbols_loop():
     first = True
     while True:
         try:
-            log.info(f"🔄 جاري جلب قائمة العملات من Binance: {BINANCE_BASE}")
-            r = get_session().get(
-                f"{BINANCE_BASE}/api/v3/ticker/24hr",
+            log.info("🔄 جاري جلب قائمة العملات من KuCoin...")
+            resp = get_session().get(
+                f"{KUCOIN_BASE}/api/v1/market/allTickers",
                 timeout=20,
-            )
-            log.info(f"📡 Binance status: {r.status_code}")
-            resp = r.json()
-            log.info(f"📦 Binance response type: {type(resp).__name__} | len: {len(resp) if isinstance(resp, list) else 'N/A'} | sample: {str(resp)[:200]}")
+            ).json()
 
-            if isinstance(resp, list) and resp:
+            tickers = resp.get("data", {}).get("ticker", [])
+            log.info(f"📦 KuCoin tickers: {len(tickers)}")
+
+            if tickers:
                 top = sorted(
-                    [s for s in resp if s["symbol"].endswith("USDT")],
-                    key=lambda x: float(x.get("quoteVolume", 0)),
+                    [t for t in tickers if t["symbol"].endswith("-USDT")],
+                    key=lambda x: float(x.get("volValue", 0)),
                     reverse=True,
                 )[:TOP_SYMBOLS_LIMIT]
-                new_syms = [s["symbol"] for s in top]
+                # نحول BTC-USDT → BTCUSDT للتوافق مع بقية الكود
+                new_syms = [from_kucoin_symbol(t["symbol"]) for t in top]
                 with symbols_cache_lock:
                     symbols_cache.clear()
                     symbols_cache.extend(new_syms)
@@ -755,38 +767,30 @@ def update_symbols_loop():
                     first = False
                     threading.Thread(target=prefetch_all, args=(list(new_syms),), daemon=True).start()
             else:
-                log.error(f"❌ Binance رد غير متوقع: {str(resp)[:300]}")
-                # fallback: استخدم عملات ثابتة لتشغيل البوت
+                log.error(f"❌ KuCoin رد غير متوقع: {str(resp)[:300]}")
                 if first:
-                    fallback = [
-                        "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT",
-                        "DOGEUSDT","ADAUSDT","AVAXUSDT","DOTUSDT","MATICUSDT",
-                        "LINKUSDT","UNIUSDT","LTCUSDT","ATOMUSDT","NEARUSDT",
-                    ]
-                    with symbols_cache_lock:
-                        symbols_cache.clear()
-                        symbols_cache.extend(fallback)
-                    log.warning(f"⚠️ استخدام fallback: {len(fallback)} عملة")
+                    _start_fallback()
                     first = False
-                    threading.Thread(target=prefetch_all, args=(list(fallback),), daemon=True).start()
 
         except Exception as e:
             log.error(f"❌ Symbols loop error: {e}")
-            # fallback عند الخطأ الكامل
             if first:
-                fallback = [
-                    "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT",
-                    "DOGEUSDT","ADAUSDT","AVAXUSDT","DOTUSDT","MATICUSDT",
-                    "LINKUSDT","UNIUSDT","LTCUSDT","ATOMUSDT","NEARUSDT",
-                ]
-                with symbols_cache_lock:
-                    symbols_cache.clear()
-                    symbols_cache.extend(fallback)
-                log.warning(f"⚠️ fallback بعد خطأ: {len(fallback)} عملة")
+                _start_fallback()
                 first = False
-                threading.Thread(target=prefetch_all, args=(list(fallback),), daemon=True).start()
 
         time.sleep(3600)
+
+def _start_fallback():
+    fallback = [
+        "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT",
+        "DOGEUSDT","ADAUSDT","AVAXUSDT","DOTUSDT","MATICUSDT",
+        "LINKUSDT","UNIUSDT","LTCUSDT","ATOMUSDT","NEARUSDT",
+    ]
+    with symbols_cache_lock:
+        symbols_cache.clear()
+        symbols_cache.extend(fallback)
+    log.warning(f"⚠️ fallback: {len(fallback)} عملة")
+    threading.Thread(target=prefetch_all, args=(list(fallback),), daemon=True).start()
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -796,7 +800,7 @@ class HealthHandler(BaseHTTPRequestHandler):
     def log_message(self, *_): pass
 
 def main():
-    log.info(f"🚀 Tripling Strategy Bot — Starting | Binance: {BINANCE_BASE}")
+    log.info(f"🚀 Tripling Strategy Bot — KuCoin API | {KUCOIN_BASE}")
     delete_webhook()
     threading.Thread(target=update_symbols_loop, daemon=True).start()
     while not symbols_cache:
@@ -810,7 +814,7 @@ def main():
         daemon=True,
     ).start()
 
-    log.info("⏳ انتظار اكتمال التحميل السريع لكل العملات…")
+    log.info("⏳ انتظار اكتمال التحميل السريع…")
     fast_prefetch_done.wait()
     log.info("✅ بدء الواتشرز")
 
