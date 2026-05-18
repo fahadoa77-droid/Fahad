@@ -19,6 +19,13 @@ TOP_SYMBOLS_LIMIT = 70
 PORT = int(os.environ.get("PORT", "8080"))
 ALERT_EXPIRY_HOURS = 4
 
+# ── Binance API Base URL ──────────────────────────────────────────────────────
+# إذا السيرفر في US استخدم: https://api1.binance.com
+BINANCE_BASE = os.environ.get("BINANCE_BASE", "https://api.binance.com")
+
+# Binance لا يدعم "60m" — يجب تحويله إلى "1h"
+TF_MAP = {"1m": "1m", "60m": "1h"}
+
 TRIPLING_PAIRS = [
     (  9,  27,  3, "1m", "1m"),
     ( 12,  36,  4, "1m", "1m"),
@@ -34,12 +41,7 @@ TRIPLING_PAIRS = [
     (180, 540, 60, "60m","60m"),
 ]
 
-# ✅ الحساب الصحيح للشموع المطلوبة:
-# 1m: أكبر confirm هو 135m → 25 شمعة × 135 = 3375 → نأخذ 3500 (هامش أمان)
-# 60m: أكبر confirm هو 540m → 540/60=9 → 25 × 9 = 225 → نأخذ 250
 FAST_FETCH_CANDLES = {"1m": 3500, "60m": 250}
-
-# المرحلة الثانية: بيانات تاريخية كاملة
 API_FETCH_CANDLES  = {"1m": 7_680, "60m": 1_500}
 CACHE_MAX_CANDLES  = {"1m": 8_500, "60m": 2_200}
 EPOCH = pd.Timestamp("1970-01-01", tz="UTC")
@@ -200,7 +202,7 @@ def poll_telegram_commands():
                         lines.append(f"• {sym} [{tf}]: {len(df)} شمعة")
                     send_telegram("\n".join(lines), chat_id)
                 elif txt == "/fetchtest":
-                    send_telegram("🔄 جاري اختبار MEXC API...", chat_id)
+                    send_telegram("🔄 جاري اختبار Binance API...", chat_id)
                     results = []
                     for tf in ["1m", "60m"]:
                         df = get_ohlcv("BTCUSDT", tf, limit=10)
@@ -216,7 +218,7 @@ def poll_telegram_commands():
                     results.append(f"\n💾 الكاش: {cache_keys} مفتاح")
                     results.append(f"⚡ سريع: {'✅' if fast_prefetch_done.is_set() else '⏳'}")
                     results.append(f"📦 كامل: {'✅' if prefetch_done.is_set() else '⏳'}")
-                    send_telegram("🧪 <b>نتيجة اختبار MEXC:</b>\n" + "\n".join(results), chat_id)
+                    send_telegram("🧪 <b>نتيجة اختبار Binance:</b>\n" + "\n".join(results), chat_id)
                 elif txt == "/reload":
                     send_telegram("🔄 جاري إعادة تحميل الكاش...", chat_id)
                     with symbols_cache_lock:
@@ -236,7 +238,7 @@ def poll_telegram_commands():
                         "3️⃣  <code>3</code> — آخر 7 أيام\n"
                         "📊  <code>/status</code> — حالة البوت والكاش\n"
                         "🔬  <code>/cache</code> — فحص الكاش\n"
-                        "🧪  <code>/fetchtest</code> — اختبار اتصال MEXC\n"
+                        "🧪  <code>/fetchtest</code> — اختبار اتصال Binance\n"
                         "🔄  <code>/reload</code> — إعادة تحميل الكاش\n"
                         "🔍  <code>/سبب</code> — تشخيص غياب الإشارات\n"
                         "📋  <code>/help</code> — قائمة الأوامر",
@@ -250,9 +252,15 @@ def poll_telegram_commands():
             time.sleep(10)
 
 def _parse_klines(resp) -> pd.DataFrame:
+    """
+    Binance klines format:
+    [open_time, open, high, low, close, volume, close_time, quote_asset_volume, ...]
+    نفس تنسيق MEXC تقريباً — العمود الأول هو open_time بالـ ms
+    """
     df = pd.DataFrame(
         resp,
-        columns=["ts","open","high","low","close","vol","close_ts","quote_vol"],
+        columns=["ts","open","high","low","close","vol","close_ts","quote_vol",
+                 "trades","taker_base","taker_quote","ignore"],
     )
     for c in ["open","high","low","close","vol"]:
         df[c] = df[c].astype(float)
@@ -260,10 +268,11 @@ def _parse_klines(resp) -> pd.DataFrame:
     return df[["ts","open","high","low","close","vol"]]
 
 def get_ohlcv(symbol: str, tf: str, limit: int = 500) -> pd.DataFrame:
+    interval = TF_MAP.get(tf, tf)   # تحويل 60m → 1h
     try:
         resp = get_session().get(
-            "https://api.mexc.com/api/v3/klines",
-            params={"symbol": symbol, "interval": tf, "limit": limit},
+            f"{BINANCE_BASE}/api/v3/klines",
+            params={"symbol": symbol, "interval": interval, "limit": min(limit, 1000)},
             timeout=10,
         ).json()
         if isinstance(resp, list) and resp:
@@ -274,19 +283,20 @@ def get_ohlcv(symbol: str, tf: str, limit: int = 500) -> pd.DataFrame:
     return pd.DataFrame()
 
 def get_ohlcv_full(symbol: str, tf: str, target: int) -> pd.DataFrame:
-    all_dfs = []
-    end_ms  = None
-    fetched = 0
-    retries = 0
+    interval = TF_MAP.get(tf, tf)   # تحويل 60m → 1h
+    all_dfs  = []
+    end_ms   = None
+    fetched  = 0
+    retries  = 0
 
     while fetched < target:
         limit  = min(1000, target - fetched)
-        params = {"symbol": symbol, "interval": tf, "limit": limit}
+        params = {"symbol": symbol, "interval": interval, "limit": limit}
         if end_ms is not None:
             params["endTime"] = end_ms
         try:
             resp = get_session().get(
-                "https://api.mexc.com/api/v3/klines",
+                f"{BINANCE_BASE}/api/v3/klines",
                 params=params,
                 timeout=15,
             ).json()
@@ -305,8 +315,9 @@ def get_ohlcv_full(symbol: str, tf: str, target: int) -> pd.DataFrame:
 
             if len(resp) < limit:
                 break
+            # Binance: العمود الأول في كل صف هو open_time
             end_ms = int(resp[0][0]) - 1
-            time.sleep(0.15)
+            time.sleep(0.12)   # Binance rate limit أريح من MEXC
 
         except requests.exceptions.Timeout:
             retries += 1
@@ -347,10 +358,6 @@ def get_cached(symbol: str, tf: str) -> pd.DataFrame:
 def prefetch_all(symbols: list):
     total = len(symbols)
 
-    # ── المرحلة الأولى: سريعة ────────────────────────────────────────
-    # ✅ نستخدم get_ohlcv_full لضمان كفاية الشموع لكل الـ pairs
-    # 1m: نحتاج 3500 شمعة (أكبر confirm = 135m × 25 = 3375)
-    # 60m: نحتاج 250 شمعة (أكبر confirm = 540m / 60 × 25 = 225)
     log.info(f"⚡ المرحلة الأولى (سريعة): {total} عملة | 1m→3500 شمعة | 60m→250 شمعة")
     fast_success = 0
     fast_failed  = 0
@@ -358,9 +365,8 @@ def prefetch_all(symbols: list):
     for i, sym in enumerate(symbols):
         for tf, n in FAST_FETCH_CANDLES.items():
             fetched = False
-            for attempt in range(3):          # ✅ retry لكل عملة
+            for attempt in range(3):
                 try:
-                    # ✅ get_ohlcv_full بدل get_ohlcv لجلب الكمية الكاملة المطلوبة
                     df = get_ohlcv_full(sym, tf, target=n)
                     if not df.empty:
                         cache_merge(sym, tf, df)
@@ -378,12 +384,11 @@ def prefetch_all(symbols: list):
                 fast_failed += 1
                 log.warning(f"❌ فشل نهائي (سريع): {sym} [{tf}]")
 
-            time.sleep(0.2)   # ✅ تجنب rate limit
+            time.sleep(0.15)
 
         if (i + 1) % 10 == 0 or i == total - 1:
             log.info(f"⚡ سريع: {i+1}/{total} | نجح: {fast_success} | فشل: {fast_failed}")
 
-    # ── التحقق من الكاش بعد اكتمال كل العملات ──
     with ohlcv_cache_lock:
         fast_cache_size = len(ohlcv_cache)
         filled_1m = sum(
@@ -392,16 +397,15 @@ def prefetch_all(symbols: list):
         )
 
     if fast_cache_size == 0:
-        log.error("❌ الكاش السريع فارغ تماماً! MEXC API فشل.")
+        log.error("❌ الكاش السريع فارغ تماماً! Binance API فشل.")
         send_telegram(
             "❌ <b>فشل التحميل السريع!</b>\n"
-            "MEXC API لا يستجيب.\n"
+            "Binance API لا يستجيب.\n"
             "💡 استخدم /fetchtest للتشخيص\n"
             "🔄 أرسل /reload للمحاولة مجدداً"
         )
         return
 
-    # ✅ fast_prefetch_done يُفعَّل فقط بعد اكتمال كل العملات بشموع كافية
     fast_prefetch_done.set()
     log.info(
         f"✅ المرحلة الأولى اكتملت | كاش: {fast_cache_size} مفتاح | "
@@ -413,7 +417,6 @@ def prefetch_all(symbols: list):
         f"❌ فشل: {fast_failed} | 📦 جاري تحميل البيانات الكاملة في الخلفية..."
     )
 
-    # ── المرحلة الثانية: كاملة تاريخية ──────────────────────────────
     log.info(f"📦 المرحلة الثانية (كاملة): {total} عملة…")
     full_success = 0
     for i, sym in enumerate(symbols):
@@ -425,7 +428,7 @@ def prefetch_all(symbols: list):
                     full_success += 1
                 else:
                     log.warning(f"⚠️ كامل فارغ: {sym} [{tf}]")
-                time.sleep(0.15)
+                time.sleep(0.12)
             except Exception as e:
                 log.error(f"full prefetch {sym} {tf}: {e}")
         if (i + 1) % 10 == 0 or i == total - 1:
@@ -454,7 +457,7 @@ def _update_batch(symbols, tf, limit):
             df = get_ohlcv(sym, tf, limit=limit)
             if not df.empty:
                 cache_merge(sym, tf, df)
-            time.sleep(0.12)
+            time.sleep(0.10)
         except Exception as e:
             log.error(f"update {sym} {tf}: {e}")
 
@@ -729,7 +732,8 @@ def update_symbols_loop():
     while True:
         try:
             resp = get_session().get(
-                "https://api.mexc.com/api/v3/ticker/24hr", timeout=15
+                f"{BINANCE_BASE}/api/v3/ticker/24hr",
+                timeout=15
             ).json()
             if isinstance(resp, list):
                 top = sorted(
@@ -741,6 +745,7 @@ def update_symbols_loop():
                 with symbols_cache_lock:
                     symbols_cache.clear()
                     symbols_cache.extend(new_syms)
+                log.info(f"✅ تحديث العملات: {len(new_syms)} عملة من Binance")
                 if first:
                     first = False
                     threading.Thread(target=prefetch_all, args=(list(new_syms),), daemon=True).start()
@@ -756,7 +761,7 @@ class HealthHandler(BaseHTTPRequestHandler):
     def log_message(self, *_): pass
 
 def main():
-    log.info("🚀 Tripling Strategy Bot — Starting")
+    log.info(f"🚀 Tripling Strategy Bot — Starting | Binance: {BINANCE_BASE}")
     delete_webhook()
     threading.Thread(target=update_symbols_loop, daemon=True).start()
     while not symbols_cache:
