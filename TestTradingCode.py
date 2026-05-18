@@ -34,38 +34,34 @@ TRIPLING_PAIRS = [
     (180, 540, 60, "60m","60m"),
 ]
 
-API_FETCH_CANDLES = {"1m": 7_680, "60m": 1_500}
-CACHE_MAX_CANDLES = {"1m": 8_500, "60m": 2_200}
+# ✅ مرحلة أولى سريعة → الإشارات تبدأ خلال دقائق
+FAST_FETCH_CANDLES = {"1m": 600, "60m": 200}
+# ✅ مرحلة ثانية كاملة → في الخلفية
+API_FETCH_CANDLES  = {"1m": 7_680, "60m": 1_500}
+CACHE_MAX_CANDLES  = {"1m": 8_500, "60m": 2_200}
 EPOCH = pd.Timestamp("1970-01-01", tz="UTC")
 
-alerted_keys      = {}
-alerted_keys_lock = threading.Lock()
-trades_history    = deque(maxlen=2000)
-trades_lock       = threading.Lock()
-symbols_cache     = []
-symbols_cache_lock= threading.Lock()
-ohlcv_cache       = {}
-ohlcv_cache_lock  = threading.Lock()
-prefetch_done     = threading.Event()
+alerted_keys       = {}
+alerted_keys_lock  = threading.Lock()
+trades_history     = deque(maxlen=2000)
+trades_lock        = threading.Lock()
+symbols_cache      = []
+symbols_cache_lock = threading.Lock()
+ohlcv_cache        = {}
+ohlcv_cache_lock   = threading.Lock()
+
+# ✅ حدثان منفصلان
+fast_prefetch_done = threading.Event()
+prefetch_done      = threading.Event()
 
 diag_counts = {
-    "total"           : 0,
-    "no_data"         : 0,
-    "macd_confirm"    : 0,
-    "donchian_confirm": 0,
-    "smi_oversold"    : 0,
-    "macd_entry"      : 0,
-    "donchian_entry"  : 0,
-    "ema50"           : 0,
-    "rsi_stoch"       : 0,
-    "donchian_third"  : 0,
-    "passed"          : 0,
+    "total": 0, "no_data": 0, "macd_confirm": 0,
+    "donchian_confirm": 0, "smi_oversold": 0, "macd_entry": 0,
+    "donchian_entry": 0, "ema50": 0, "rsi_stoch": 0,
+    "donchian_third": 0, "passed": 0,
 }
 diag_lock = threading.Lock()
-
-# ─── عداد تشخيص الكاش ────────────────────────────────────────────────────────
-cache_diag_logged = threading.Event()  # نسجل مرة واحدة بس
-
+cache_diag_logged = threading.Event()
 _local = threading.local()
 
 def get_session() -> requests.Session:
@@ -79,11 +75,10 @@ def delete_webhook():
     try:
         r = get_session().post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook",
-            json={"drop_pending_updates": True},
-            timeout=10,
+            json={"drop_pending_updates": True}, timeout=10,
         ).json()
         if r.get("ok"):
-            log.info("✅ تم حذف الـ Webhook بنجاح — getUpdates جاهز")
+            log.info("✅ تم حذف الـ Webhook")
         else:
             log.warning(f"⚠️ deleteWebhook: {r}")
     except Exception as e:
@@ -139,7 +134,10 @@ def get_report(period="today") -> str:
         return f"<b>{title}:</b>\nلا توجد إشارات."
     lines = [f"<b>{title} ({len(rows)})</b>\n" + "━" * 15]
     for t in rows:
-        lines.append(f"✅ {t['symbol']} | {t['timeframe']} | {t['price']:.4g} | {t['time'].strftime('%H:%M')}")
+        lines.append(
+            f"✅ {t['symbol']} | {t['timeframe']} | "
+            f"{t['price']:.4g} | {t['time'].strftime('%H:%M')}"
+        )
     return "\n".join(lines)
 
 def poll_telegram_commands():
@@ -163,11 +161,9 @@ def poll_telegram_commands():
                 msg     = upd.get("message", {})
                 txt     = msg.get("text", "").strip()
                 chat_id = str(msg.get("chat", {}).get("id", ""))
-
                 if not txt or not chat_id:
                     continue
-
-                log.info(f"📩 أمر وصل: '{txt}' من {chat_id}")
+                log.info(f"📩 أمر: '{txt}' من {chat_id}")
 
                 if txt == "1":
                     send_telegram(get_report("today"), chat_id)
@@ -177,35 +173,72 @@ def poll_telegram_commands():
                     send_telegram(get_report("week"), chat_id)
                 elif txt in ("/سبب", "/diag"):
                     if diag_counts["total"] == 0:
-                        send_telegram("⚠️ لا توجد بيانات تشخيص بعد، انتظر دورة فحص واحدة على الأقل.", chat_id)
+                        send_telegram("⚠️ لا توجد بيانات تشخيص بعد.", chat_id)
                     else:
                         send_telegram(build_diag_msg(reset=False), chat_id)
                 elif txt == "/status":
-                    with trades_lock:       cnt    = len(trades_history)
+                    with trades_lock:       cnt  = len(trades_history)
                     with alerted_keys_lock: active = len(alerted_keys)
+                    with ohlcv_cache_lock:  keys = len(ohlcv_cache)
                     send_telegram(
-                        f"🤖 البوت يعمل\n📊 إجمالي الإشارات: {cnt}\n🔑 نشطة: {active}\n💾 كاش: {len(ohlcv_cache)}",
-                        chat_id
+                        f"🤖 البوت يعمل\n"
+                        f"📊 إجمالي الإشارات: {cnt}\n"
+                        f"🔑 تنبيهات نشطة: {active}\n"
+                        f"💾 الكاش: {keys} مفتاح\n"
+                        f"⚡ تحميل سريع: {'✅' if fast_prefetch_done.is_set() else '⏳'}\n"
+                        f"📦 تحميل كامل: {'✅' if prefetch_done.is_set() else '⏳'}",
+                        chat_id,
                     )
                 elif txt == "/cache":
-                    # ✅ أمر جديد لفحص حجم الكاش الفعلي
                     with ohlcv_cache_lock:
-                        sample = list(ohlcv_cache.items())[:5]
-                    lines = ["🔬 <b>فحص الكاش (أول 5 عملات):</b>"]
+                        sample     = list(ohlcv_cache.items())[:5]
+                        total_keys = len(ohlcv_cache)
+                    lines = [f"🔬 <b>الكاش ({total_keys} مفتاح إجمالي):</b>"]
                     for (sym, tf), df in sample:
                         lines.append(f"• {sym} [{tf}]: {len(df)} شمعة")
                     send_telegram("\n".join(lines), chat_id)
+                elif txt == "/fetchtest":
+                    send_telegram("🔄 جاري اختبار MEXC API...", chat_id)
+                    results = []
+                    for tf in ["1m", "60m"]:
+                        df = get_ohlcv("BTCUSDT", tf, limit=10)
+                        if df.empty:
+                            results.append(f"❌ BTCUSDT [{tf}]: فشل الجلب")
+                        else:
+                            results.append(
+                                f"✅ BTCUSDT [{tf}]: {len(df)} شمعة — "
+                                f"آخر سعر {df['close'].iloc[-1]:.4g}"
+                            )
+                    with ohlcv_cache_lock:
+                        cache_keys = len(ohlcv_cache)
+                    results.append(f"\n💾 الكاش: {cache_keys} مفتاح")
+                    results.append(f"⚡ سريع: {'✅' if fast_prefetch_done.is_set() else '⏳'}")
+                    results.append(f"📦 كامل: {'✅' if prefetch_done.is_set() else '⏳'}")
+                    send_telegram("🧪 <b>نتيجة اختبار MEXC:</b>\n" + "\n".join(results), chat_id)
+                elif txt == "/reload":
+                    send_telegram("🔄 جاري إعادة تحميل الكاش...", chat_id)
+                    with symbols_cache_lock:
+                        syms = list(symbols_cache)
+                    if not syms:
+                        send_telegram("⚠️ لا توجد عملات في القائمة.", chat_id)
+                    else:
+                        fast_prefetch_done.clear()
+                        prefetch_done.clear()
+                        threading.Thread(target=prefetch_all, args=(syms,), daemon=True).start()
+                        send_telegram(f"🚀 بدأ إعادة التحميل لـ {len(syms)} عملة...", chat_id)
                 elif txt == "/help":
                     send_telegram(
                         "📋 <b>الأوامر المتاحة:</b>\n"
                         "1️⃣  <code>1</code> — إشارات اليوم\n"
                         "2️⃣  <code>2</code> — إشارات أمس\n"
                         "3️⃣  <code>3</code> — آخر 7 أيام\n"
-                        "📊  <code>/status</code> — حالة البوت\n"
-                        "🔬  <code>/cache</code> — فحص حجم الكاش الفعلي\n"
-                        "🔍  <code>/سبب</code> — ليش ما في إشارات (تشخيص)\n"
+                        "📊  <code>/status</code> — حالة البوت والكاش\n"
+                        "🔬  <code>/cache</code> — فحص الكاش\n"
+                        "🧪  <code>/fetchtest</code> — اختبار اتصال MEXC\n"
+                        "🔄  <code>/reload</code> — إعادة تحميل الكاش\n"
+                        "🔍  <code>/سبب</code> — تشخيص غياب الإشارات\n"
                         "📋  <code>/help</code> — قائمة الأوامر",
-                        chat_id
+                        chat_id,
                     )
 
         except requests.exceptions.Timeout:
@@ -215,21 +248,25 @@ def poll_telegram_commands():
             time.sleep(10)
 
 def _parse_klines(resp) -> pd.DataFrame:
-    df = pd.DataFrame(resp, columns=["ts","open","high","low","close","vol","close_ts","quote_vol"])
+    df = pd.DataFrame(
+        resp,
+        columns=["ts","open","high","low","close","vol","close_ts","quote_vol"],
+    )
     for c in ["open","high","low","close","vol"]:
         df[c] = df[c].astype(float)
     df["ts"] = pd.to_datetime(df["ts"].astype(int), unit="ms", utc=True)
-    return df[["ts", "open", "high", "low", "close", "vol"]]
+    return df[["ts","open","high","low","close","vol"]]
 
 def get_ohlcv(symbol: str, tf: str, limit: int = 500) -> pd.DataFrame:
     try:
         resp = get_session().get(
             "https://api.mexc.com/api/v3/klines",
             params={"symbol": symbol, "interval": tf, "limit": limit},
-            timeout=8,
+            timeout=10,
         ).json()
         if isinstance(resp, list) and resp:
             return _parse_klines(resp)
+        log.warning(f"⚠️ رد غير صالح {symbol}/{tf}: {str(resp)[:120]}")
     except Exception as e:
         log.error(f"get_ohlcv {symbol} {tf}: {e}")
     return pd.DataFrame()
@@ -238,25 +275,50 @@ def get_ohlcv_full(symbol: str, tf: str, target: int) -> pd.DataFrame:
     all_dfs = []
     end_ms  = None
     fetched = 0
+    retries = 0
+
     while fetched < target:
         limit  = min(1000, target - fetched)
         params = {"symbol": symbol, "interval": tf, "limit": limit}
         if end_ms is not None:
             params["endTime"] = end_ms
         try:
-            resp = get_session().get("https://api.mexc.com/api/v3/klines", params=params, timeout=10).json()
+            resp = get_session().get(
+                "https://api.mexc.com/api/v3/klines",
+                params=params,
+                timeout=15,
+            ).json()
+
             if not isinstance(resp, list) or not resp:
-                break
+                log.warning(f"⚠️ رد غير صالح {symbol}/{tf}: {str(resp)[:120]}")
+                retries += 1
+                if retries >= 3:
+                    break
+                time.sleep(2 ** retries)
+                continue
+
             all_dfs.insert(0, _parse_klines(resp))
             fetched += len(resp)
+            retries = 0
+
             if len(resp) < limit:
                 break
             end_ms = int(resp[0][0]) - 1
-            time.sleep(0.12)
+            time.sleep(0.15)
+
+        except requests.exceptions.Timeout:
+            retries += 1
+            log.warning(f"⏱️ timeout {symbol}/{tf} (محاولة {retries})")
+            if retries >= 3:
+                break
+            time.sleep(2 ** retries)
         except Exception as e:
-            log.error(f"full fetch error {symbol}: {e}")
-            time.sleep(2)
-            break
+            retries += 1
+            log.error(f"full fetch error {symbol}/{tf} (محاولة {retries}): {e}")
+            if retries >= 3:
+                break
+            time.sleep(2 ** retries)
+
     return (
         pd.concat(all_dfs).drop_duplicates(subset="ts").sort_values("ts").reset_index(drop=True)
         if all_dfs else pd.DataFrame()
@@ -282,33 +344,79 @@ def get_cached(symbol: str, tf: str) -> pd.DataFrame:
 
 def prefetch_all(symbols: list):
     total = len(symbols)
-    log.info(f"📦 بدء التحميل الكامل لـ {total} عملة…")
+
+    # ── المرحلة الأولى: سريعة ────────────────────────────────────────
+    log.info(f"⚡ المرحلة الأولى (سريعة): {total} عملة…")
+    fast_success = 0
+    for i, sym in enumerate(symbols):
+        for tf, n in FAST_FETCH_CANDLES.items():
+            try:
+                df = get_ohlcv(sym, tf, limit=n)
+                if not df.empty:
+                    cache_merge(sym, tf, df)
+                    fast_success += 1
+                else:
+                    log.warning(f"⚠️ سريع فارغ: {sym} [{tf}]")
+                time.sleep(0.1)
+            except Exception as e:
+                log.error(f"fast prefetch {sym} {tf}: {e}")
+        if (i + 1) % 20 == 0 or i == total - 1:
+            log.info(f"⚡ سريع: {i+1}/{total}")
+
+    with ohlcv_cache_lock:
+        fast_cache_size = len(ohlcv_cache)
+
+    # ✅ التحقق قبل تفعيل fast_prefetch_done
+    if fast_cache_size == 0:
+        log.error("❌ الكاش السريع فارغ! MEXC API فشل.")
+        send_telegram(
+            "❌ <b>فشل التحميل السريع!</b>\n"
+            "MEXC API لا يستجيب.\n"
+            "💡 استخدم /fetchtest للتشخيص\n"
+            "🔄 أرسل /reload للمحاولة مجدداً"
+        )
+        return
+
+    fast_prefetch_done.set()
+    log.info(f"✅ المرحلة الأولى اكتملت | كاش: {fast_cache_size} مفتاح")
+    send_telegram(
+        f"⚡ <b>التحميل السريع اكتمل — الإشارات بدأت!</b>\n"
+        f"📈 عملات: {total} | 💾 مفاتيح: {fast_cache_size}\n"
+        f"📦 جاري تحميل البيانات الكاملة في الخلفية..."
+    )
+
+    # ── المرحلة الثانية: كاملة تاريخية ──────────────────────────────
+    log.info(f"📦 المرحلة الثانية (كاملة): {total} عملة…")
+    full_success = 0
     for i, sym in enumerate(symbols):
         for tf, n in API_FETCH_CANDLES.items():
             try:
                 df = get_ohlcv_full(sym, tf, target=n)
                 if not df.empty:
                     cache_merge(sym, tf, df)
-                    # ✅ تشخيص: سجّل أول عملة لكل timeframe
-                    if i == 0:
-                        log.info(f"🔬 تشخيص أول عملة: {sym} [{tf}] = {len(df)} شمعة")
-                time.sleep(0.12)
+                    full_success += 1
+                else:
+                    log.warning(f"⚠️ كامل فارغ: {sym} [{tf}]")
+                time.sleep(0.15)
             except Exception as e:
-                log.error(f"prefetch {sym} {tf}: {e}")
+                log.error(f"full prefetch {sym} {tf}: {e}")
         if (i + 1) % 10 == 0 or i == total - 1:
-            log.info(f"📦 جاري التحميل: {i+1}/{total}")
+            log.info(f"📦 كامل: {i+1}/{total}")
 
-    # ✅ تشخيص: أرسل تقرير الكاش بعد اكتمال التحميل
     with ohlcv_cache_lock:
+        full_cache_size = len(ohlcv_cache)
         sample = list(ohlcv_cache.items())[:3]
-    diag_lines = ["🔬 <b>تشخيص الكاش بعد التحميل:</b>"]
+
+    prefetch_done.set()
+    diag_lines = ["🔬 <b>عينة من الكاش:</b>"]
     for (sym, tf), df in sample:
         diag_lines.append(f"• {sym} [{tf}]: {len(df)} شمعة")
 
-    prefetch_done.set()
-    log.info("✅ اكتمل التحميل التاريخي بالكامل.")
+    log.info(f"✅ التحميل الكامل اكتمل | كاش: {full_cache_size} مفتاح")
     send_telegram(
-        f"✅ <b>التحميل التاريخي اكتمل</b>\n📈 عملات: {total}\n\n" +
+        f"✅ <b>التحميل الكامل اكتمل</b>\n"
+        f"📈 عملات: {total} | 💾 مفاتيح: {full_cache_size}\n"
+        f"✔️ نجح: {full_success}/{total*2}\n\n" +
         "\n".join(diag_lines)
     )
 
@@ -325,7 +433,7 @@ def _update_batch(symbols, tf, limit):
 def cache_updater_1m():
     while True:
         time.sleep(45)
-        if prefetch_done.is_set():
+        if fast_prefetch_done.is_set():
             with symbols_cache_lock:
                 syms = list(symbols_cache)
             if syms:
@@ -334,7 +442,7 @@ def cache_updater_1m():
 def cache_updater_60m():
     while True:
         time.sleep(45 * 60)
-        if prefetch_done.is_set():
+        if fast_prefetch_done.is_set():
             with symbols_cache_lock:
                 syms = list(symbols_cache)
             if syms:
@@ -441,11 +549,10 @@ def check_rsi_stoch(df: pd.DataFrame, lookback=5) -> bool:
     )
     if not rsi_cross:
         return False
-    lo15 = low.rolling(15).min()
-    hi15 = high.rolling(15).max()
+    lo15  = low.rolling(15).min()
+    hi15  = high.rolling(15).max()
     k_raw = 100 * (close - lo15) / (hi15 - lo15 + 1e-10)
     k     = k_raw.rolling(3).mean()
-    d     = k.rolling(3).mean()
     return any(k.iloc[i-1] < 20 and k.iloc[i] >= 20 for i in range(-lookback, 0))
 
 DIAG_LABELS = {
@@ -462,34 +569,30 @@ DIAG_LABELS = {
 
 def build_diag_msg(reset: bool = False) -> str:
     with diag_lock:
-        t        = diag_counts["total"] or 1
-        non_total= {k: v for k, v in diag_counts.items() if k not in ["total", "passed"]}
-        worst_k  = max(non_total, key=lambda k: non_total[k])
-        worst_v  = non_total[worst_k]
-
+        t         = diag_counts["total"] or 1
+        non_total = {k: v for k, v in diag_counts.items() if k not in ["total", "passed"]}
+        worst_k   = max(non_total, key=lambda k: non_total[k])
+        worst_v   = non_total[worst_k]
         lines = [
-            f"🔍 <b>تقرير التشخيص</b>",
-            f"━━━━━━━━━━━━━━━",
+            "🔍 <b>تقرير التشخيص</b>",
+            "━━━━━━━━━━━━━━━",
             f"📊 إجمالي الفحوصات: <b>{t}</b>",
-            f"",
+            "",
         ]
         for k, label in DIAG_LABELS.items():
             count = diag_counts[k]
             pct   = int(count / t * 100)
             bar   = "█" * (pct // 10) + "░" * (10 - pct // 10)
             lines.append(f"❌ {label}\n    {bar} {count} ({pct}%)")
-
         lines += [
-            f"",
+            "",
             f"✅ اجتازت الكل: <b>{diag_counts['passed']}</b>",
-            f"━━━━━━━━━━━━━━━",
+            "━━━━━━━━━━━━━━━",
             f"🏆 أكثر سبب فشل: <b>{DIAG_LABELS.get(worst_k, worst_k)}</b> ({worst_v})",
         ]
-
         if reset:
             for k in diag_counts:
                 diag_counts[k] = 0
-
     return "\n".join(lines)
 
 def send_diag_report():
@@ -497,13 +600,12 @@ def send_diag_report():
         time.sleep(3600)
         send_telegram(build_diag_msg(reset=True))
 
-def scan_symbol(symbol: str, entry_min: int, confirm_min: int, third_min: int, ec_api: str, t_api: str):
+def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
     raw_ec = get_cached(symbol, ec_api)
     raw_t  = get_cached(symbol, t_api)
 
-    # ✅ تشخيص: سجّل حجم الكاش لأول عملة فقط (مرة واحدة)
     if not cache_diag_logged.is_set():
-        log.info(f"🔍 تشخيص كاش | {symbol} | ec[{ec_api}]={len(raw_ec)} | t[{t_api}]={len(raw_t)}")
+        log.info(f"🔍 كاش | {symbol} | ec[{ec_api}]={len(raw_ec)} | t[{t_api}]={len(raw_t)}")
         cache_diag_logged.set()
 
     with diag_lock:
@@ -526,31 +628,24 @@ def scan_symbol(symbol: str, entry_min: int, confirm_min: int, third_min: int, e
     if not check_macd_green(df_confirm):
         with diag_lock: diag_counts["macd_confirm"] += 1
         return
-
     if not check_donchian(df_confirm, direction="green"):
         with diag_lock: diag_counts["donchian_confirm"] += 1
         return
-
     if not check_smi_oversold(df_entry):
         with diag_lock: diag_counts["smi_oversold"] += 1
         return
-
     if not check_macd_entry(df_entry, entry_min):
         with diag_lock: diag_counts["macd_entry"] += 1
         return
-
     if not check_donchian(df_entry, direction="green"):
         with diag_lock: diag_counts["donchian_entry"] += 1
         return
-
     if not check_ema50_below(df_entry):
         with diag_lock: diag_counts["ema50"] += 1
         return
-
     if not check_rsi_stoch(df_third):
         with diag_lock: diag_counts["rsi_stoch"] += 1
         return
-
     if not check_donchian(df_third, direction="red"):
         with diag_lock: diag_counts["donchian_third"] += 1
         return
@@ -579,26 +674,25 @@ def get_next_close(tf_minutes: int) -> datetime:
     total = int((now - epoch).total_seconds() / 60)
     return epoch + timedelta(minutes=((total // tf_minutes) + 1) * tf_minutes)
 
-def candle_watcher(entry_min: int, confirm_min: int, third_min: int, ec_api: str, t_api: str):
+def candle_watcher(entry_min, confirm_min, third_min, ec_api, t_api):
     while True:
         nxt  = get_next_close(entry_min)
         wait = (nxt - datetime.now(timezone.utc)).total_seconds()
         time.sleep(max(wait, 0) + 2.0)
         cleanup_alerted_keys()
-        if not prefetch_done.is_set():
+        # ✅ يكفي التحميل السريع لبدء الفحص
+        if not fast_prefetch_done.is_set():
             continue
         with symbols_cache_lock:
             syms = list(symbols_cache)
         if not syms:
             continue
-        # ✅ إعادة تفعيل التشخيص في كل دورة فحص
         cache_diag_logged.clear()
-        fn = partial(scan_symbol,
-                     entry_min=entry_min,
-                     confirm_min=confirm_min,
-                     third_min=third_min,
-                     ec_api=ec_api,
-                     t_api=t_api)
+        fn = partial(
+            scan_symbol,
+            entry_min=entry_min, confirm_min=confirm_min,
+            third_min=third_min, ec_api=ec_api, t_api=t_api,
+        )
         with ThreadPoolExecutor(max_workers=4) as ex:
             ex.map(fn, syms)
 
@@ -606,12 +700,14 @@ def update_symbols_loop():
     first = True
     while True:
         try:
-            resp = get_session().get("https://api.mexc.com/api/v3/ticker/24hr", timeout=15).json()
+            resp = get_session().get(
+                "https://api.mexc.com/api/v3/ticker/24hr", timeout=15
+            ).json()
             if isinstance(resp, list):
                 top = sorted(
                     [s for s in resp if s["symbol"].endswith("USDT")],
                     key=lambda x: float(x.get("quoteVolume", 0)),
-                    reverse=True
+                    reverse=True,
                 )[:TOP_SYMBOLS_LIMIT]
                 new_syms = [s["symbol"] for s in top]
                 with symbols_cache_lock:
@@ -643,16 +739,20 @@ def main():
     threading.Thread(target=send_diag_report,       daemon=True).start()
     threading.Thread(
         target=lambda: HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever(),
-        daemon=True
+        daemon=True,
     ).start()
-    log.info("⏳ جاري جلب البيانات التاريخية...")
-    prefetch_done.wait()
+
+    log.info("⏳ انتظار التحميل السريع…")
+    fast_prefetch_done.wait()  # ✅ ينتظر السريع فقط (دقائق لا ساعة)
+    log.info("✅ بدء الواتشرز")
+
     for entry_min, confirm_min, third_min, ec_api, t_api in TRIPLING_PAIRS:
         threading.Thread(
             target=candle_watcher,
             args=(entry_min, confirm_min, third_min, ec_api, t_api),
-            daemon=True
+            daemon=True,
         ).start()
+
     log.info("✅ جميع الواتشرز تعمل.")
     while True:
         time.sleep(60)
