@@ -19,10 +19,7 @@ TOP_SYMBOLS_LIMIT = 70
 PORT = int(os.environ.get("PORT", "8080"))
 ALERT_EXPIRY_HOURS = 4
 
-# ── KuCoin API — بدون قيود جغرافية ──────────────────────────────────────────
 KUCOIN_BASE = "https://api.kucoin.com"
-# KuCoin يستخدم صيغة BTC-USDT بدل BTCUSDT
-# TF: 1min, 3min, 5min, 15min, 30min, 1hour, 2hour, 4hour, 6hour, 8hour, 12hour, 1day
 TF_MAP = {"1m": "1min", "60m": "1hour"}
 
 TRIPLING_PAIRS = [
@@ -49,7 +46,7 @@ alerted_keys       = {}
 alerted_keys_lock  = threading.Lock()
 trades_history     = deque(maxlen=2000)
 trades_lock        = threading.Lock()
-symbols_cache      = []          # يخزن صيغة BTCUSDT داخلياً
+symbols_cache      = []
 symbols_cache_lock = threading.Lock()
 ohlcv_cache        = {}
 ohlcv_cache_lock   = threading.Lock()
@@ -67,9 +64,7 @@ diag_lock = threading.Lock()
 cache_diag_logged = threading.Event()
 _local = threading.local()
 
-# ── KuCoin helpers ─────────────────────────────────────────────────────────────
 def to_kucoin_symbol(symbol: str) -> str:
-    """BTCUSDT → BTC-USDT"""
     if "-" in symbol:
         return symbol
     if symbol.endswith("USDT"):
@@ -77,7 +72,6 @@ def to_kucoin_symbol(symbol: str) -> str:
     return symbol
 
 def from_kucoin_symbol(symbol: str) -> str:
-    """BTC-USDT → BTCUSDT"""
     return symbol.replace("-", "")
 
 def get_session() -> requests.Session:
@@ -152,7 +146,7 @@ def get_report(period="today") -> str:
     for t in rows:
         lines.append(
             f"✅ {t['symbol']} | {t['timeframe']} | "
-            f"{t['price']:.4g} | {t['time'].strftime('%H:%M')}"
+            f"{t['price']:.4g} | {t['time'].strftime('%H:%M UTC')}"
         )
     return "\n".join(lines)
 
@@ -196,8 +190,10 @@ def poll_telegram_commands():
                     with trades_lock:       cnt    = len(trades_history)
                     with alerted_keys_lock: active = len(alerted_keys)
                     with ohlcv_cache_lock:  keys   = len(ohlcv_cache)
+                    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
                     send_telegram(
                         f"🤖 البوت يعمل — KuCoin API\n"
+                        f"🕐 الوقت الحالي: {now_utc}\n"
                         f"📊 إجمالي الإشارات: {cnt}\n"
                         f"🔑 تنبيهات نشطة: {active}\n"
                         f"💾 الكاش: {keys} مفتاح\n"
@@ -263,14 +259,10 @@ def poll_telegram_commands():
             log.error(f"❌ Polling error: {e}")
             time.sleep(10)
 
-# ── KuCoin klines parser ────────────────────────────────────────────────────────
-# KuCoin يرجع: [[timestamp_sec, open, close, high, low, volume, turnover], ...]
-# مرتبة من الأحدث للأقدم — نعكسها
 def _parse_klines(resp) -> pd.DataFrame:
     df = pd.DataFrame(resp, columns=["ts","open","close","high","low","vol","turnover"])
     for c in ["open","high","low","close","vol"]:
         df[c] = df[c].astype(float)
-    # KuCoin timestamp بالثواني
     df["ts"] = pd.to_datetime(df["ts"].astype(int), unit="s", utc=True)
     df = df.sort_values("ts").reset_index(drop=True)
     return df[["ts","open","high","low","close","vol"]]
@@ -278,7 +270,6 @@ def _parse_klines(resp) -> pd.DataFrame:
 def get_ohlcv(symbol: str, tf: str, limit: int = 500) -> pd.DataFrame:
     kc_sym  = to_kucoin_symbol(symbol)
     kc_tf   = TF_MAP.get(tf, "1min")
-    # KuCoin: startAt و endAt بالثواني — نجلب آخر limit شمعة
     end_sec = int(time.time())
     tf_sec  = 60 if tf == "1m" else 3600
     start_sec = end_sec - limit * tf_sec
@@ -301,7 +292,6 @@ def get_ohlcv_full(symbol: str, tf: str, target: int) -> pd.DataFrame:
     kc_sym  = to_kucoin_symbol(symbol)
     kc_tf   = TF_MAP.get(tf, "1min")
     tf_sec  = 60 if tf == "1m" else 3600
-    # KuCoin يرجع max 1500 شمعة لكل طلب
     KUCOIN_MAX = 1500
     all_dfs  = []
     end_sec  = int(time.time())
@@ -332,7 +322,7 @@ def get_ohlcv_full(symbol: str, tf: str, target: int) -> pd.DataFrame:
             all_dfs.insert(0, df)
             fetched  += len(df)
             retries   = 0
-            end_sec   = start_sec - 1   # نتحرك للخلف
+            end_sec   = start_sec - 1
 
             if len(df) < batch:
                 break
@@ -704,11 +694,21 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
             return
         alerted_keys[key] = datetime.now(timezone.utc)
 
-    price = df_entry["close"].iloc[-1]
+    price   = df_entry["close"].iloc[-1]
+    now_utc = datetime.now(timezone.utc)
+    # وقت إغلاق الشمعة بتوقيت UTC
+    candle_time = df_entry["ts"].iloc[-1].strftime("%Y-%m-%d %H:%M UTC")
+    # وقت الإشارة بتوقيت UTC
+    signal_time = now_utc.strftime("%Y-%m-%d %H:%M UTC")
+
     save_signal(symbol, price, entry_min, confirm_min, third_min)
     send_telegram(
-        f"🚨 <b>إشارة دخول</b>\n🪙 <b>{symbol}</b>\n"
-        f"🎯 الدخول: <b>{entry_min}m</b>\n💰 السعر: {price:.6g}"
+        f"🚨 <b>إشارة دخول</b>\n"
+        f"🪙 <b>{symbol}</b>\n"
+        f"🎯 الدخول: <b>{entry_min}m</b>\n"
+        f"💰 السعر: {price:.6g}\n"
+        f"🕯️ إغلاق الشمعة: {candle_time}\n"
+        f"🕐 وقت الإشارة: {signal_time}"
     )
 
 def get_next_close(tf_minutes: int) -> datetime:
@@ -757,7 +757,6 @@ def update_symbols_loop():
                     key=lambda x: float(x.get("volValue", 0)),
                     reverse=True,
                 )[:TOP_SYMBOLS_LIMIT]
-                # نحول BTC-USDT → BTCUSDT للتوافق مع بقية الكود
                 new_syms = [from_kucoin_symbol(t["symbol"]) for t in top]
                 with symbols_cache_lock:
                     symbols_cache.clear()
