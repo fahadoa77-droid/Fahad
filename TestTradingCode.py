@@ -1,6 +1,7 @@
 import os
 import requests
 import pandas as pd
+import numpy as np
 import time
 import logging
 import threading
@@ -55,26 +56,28 @@ fast_prefetch_done = threading.Event()
 prefetch_done      = threading.Event()
 
 diag_counts = {
-    "total": 0, "no_data": 0, "macd_confirm": 0,
-    "donchian_confirm": 0, "smi_oversold": 0, "macd_entry": 0,
-    "donchian_entry": 0, "ema50": 0, "rsi_stoch": 0,
-    "donchian_third": 0, "passed": 0,
+    "total": 0, "no_data": 0,
+    "macd_confirm": 0, "donchian_confirm": 0,
+    "macd_red": 0, "donchian_entry": 0,
+    "ema50": 0, "smi_oversold": 0,
+    "rsi_stoch": 0, "passed": 0,
 }
 diag_lock = threading.Lock()
 cache_diag_logged = threading.Event()
 _local = threading.local()
 
-def to_kucoin_symbol(symbol: str) -> str:
-    if "-" in symbol:
-        return symbol
-    if symbol.endswith("USDT"):
-        return symbol[:-4] + "-USDT"
+# ──────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────
+def to_kucoin_symbol(symbol):
+    if "-" in symbol: return symbol
+    if symbol.endswith("USDT"): return symbol[:-4] + "-USDT"
     return symbol
 
-def from_kucoin_symbol(symbol: str) -> str:
+def from_kucoin_symbol(symbol):
     return symbol.replace("-", "")
 
-def get_session() -> requests.Session:
+def get_session():
     if not hasattr(_local, "s"):
         s = requests.Session()
         s.headers.update({"Accept-Encoding": "gzip", "User-Agent": "Mozilla/5.0"})
@@ -87,19 +90,17 @@ def delete_webhook():
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook",
             json={"drop_pending_updates": True}, timeout=10,
         ).json()
-        if r.get("ok"):
-            log.info("✅ تم حذف الـ Webhook")
-        else:
-            log.warning(f"⚠️ deleteWebhook: {r}")
+        if r.get("ok"): log.info("✅ تم حذف الـ Webhook")
+        else: log.warning(f"⚠️ deleteWebhook: {r}")
     except Exception as e:
         log.error(f"deleteWebhook error: {e}")
 
 def cleanup_alerted_keys():
     now = datetime.now(timezone.utc)
     with alerted_keys_lock:
-        expired = [k for k, t in list(alerted_keys.items()) if now - t > timedelta(hours=ALERT_EXPIRY_HOURS)]
-        for k in expired:
-            del alerted_keys[k]
+        expired = [k for k, t in list(alerted_keys.items())
+                   if now - t > timedelta(hours=ALERT_EXPIRY_HOURS)]
+        for k in expired: del alerted_keys[k]
 
 def save_signal(symbol, price, entry_min, confirm_min, third_min):
     with trades_lock:
@@ -110,7 +111,7 @@ def save_signal(symbol, price, entry_min, confirm_min, third_min):
             "timeframe": f"{entry_min}m/{confirm_min}m/{third_min}m",
         })
 
-def send_telegram(msg: str, chat_id: str = None) -> bool:
+def send_telegram(msg, chat_id=None):
     target = chat_id or TELEGRAM_CHAT_ID
     try:
         r = get_session().post(
@@ -118,14 +119,13 @@ def send_telegram(msg: str, chat_id: str = None) -> bool:
             json={"chat_id": target, "text": msg, "parse_mode": "HTML"},
             timeout=10,
         ).json()
-        if not r.get("ok"):
-            log.error(f"Telegram sendMessage failed: {r}")
+        if not r.get("ok"): log.error(f"Telegram error: {r}")
         return r.get("ok", False)
     except Exception as e:
         log.error(f"Telegram send error: {e}")
         return False
 
-def get_report(period="today") -> str:
+def get_report(period="today"):
     now = datetime.now(timezone.utc)
     if period == "today":
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -137,11 +137,9 @@ def get_report(period="today") -> str:
     else:
         start = now - timedelta(days=7)
         end, title = now, "🗓️ آخر 7 أيام"
-
     with trades_lock:
         rows = [t for t in trades_history if start <= t["time"] < end]
-    if not rows:
-        return f"<b>{title}:</b>\nلا توجد إشارات."
+    if not rows: return f"<b>{title}:</b>\nلا توجد إشارات."
     lines = [f"<b>{title} ({len(rows)})</b>\n" + "━" * 15]
     for t in rows:
         lines.append(
@@ -150,124 +148,16 @@ def get_report(period="today") -> str:
         )
     return "\n".join(lines)
 
-def poll_telegram_commands():
-    last_id = 0
-    log.info("📡 بدء الاستماع لأوامر التلقرام…")
-    while True:
-        try:
-            r = get_session().get(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
-                params={"offset": last_id + 1, "timeout": 30},
-                timeout=35,
-            ).json()
-
-            if not r.get("ok"):
-                log.warning(f"getUpdates not ok: {r}")
-                time.sleep(5)
-                continue
-
-            for upd in r.get("result", []):
-                last_id = upd["update_id"]
-                msg     = upd.get("message", {})
-                txt     = msg.get("text", "").strip()
-                chat_id = str(msg.get("chat", {}).get("id", ""))
-                if not txt or not chat_id:
-                    continue
-                log.info(f"📩 أمر: '{txt}' من {chat_id}")
-
-                if txt == "1":
-                    send_telegram(get_report("today"), chat_id)
-                elif txt == "2":
-                    send_telegram(get_report("yesterday"), chat_id)
-                elif txt == "3":
-                    send_telegram(get_report("week"), chat_id)
-                elif txt in ("/سبب", "/diag"):
-                    if diag_counts["total"] == 0:
-                        send_telegram("⚠️ لا توجد بيانات تشخيص بعد.", chat_id)
-                    else:
-                        send_telegram(build_diag_msg(reset=False), chat_id)
-                elif txt == "/status":
-                    with trades_lock:       cnt    = len(trades_history)
-                    with alerted_keys_lock: active = len(alerted_keys)
-                    with ohlcv_cache_lock:  keys   = len(ohlcv_cache)
-                    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-                    send_telegram(
-                        f"🤖 البوت يعمل — KuCoin API\n"
-                        f"🕐 الوقت الحالي: {now_utc}\n"
-                        f"📊 إجمالي الإشارات: {cnt}\n"
-                        f"🔑 تنبيهات نشطة: {active}\n"
-                        f"💾 الكاش: {keys} مفتاح\n"
-                        f"⚡ تحميل سريع: {'✅' if fast_prefetch_done.is_set() else '⏳'}\n"
-                        f"📦 تحميل كامل: {'✅' if prefetch_done.is_set() else '⏳'}",
-                        chat_id,
-                    )
-                elif txt == "/cache":
-                    with ohlcv_cache_lock:
-                        sample     = list(ohlcv_cache.items())[:5]
-                        total_keys = len(ohlcv_cache)
-                    lines = [f"🔬 <b>الكاش ({total_keys} مفتاح إجمالي):</b>"]
-                    for (sym, tf), df in sample:
-                        lines.append(f"• {sym} [{tf}]: {len(df)} شمعة")
-                    send_telegram("\n".join(lines), chat_id)
-                elif txt == "/fetchtest":
-                    send_telegram("🔄 جاري اختبار KuCoin API...", chat_id)
-                    results = []
-                    for tf in ["1m", "60m"]:
-                        df = get_ohlcv("BTCUSDT", tf, limit=10)
-                        if df.empty:
-                            results.append(f"❌ BTCUSDT [{tf}]: فشل الجلب")
-                        else:
-                            results.append(
-                                f"✅ BTCUSDT [{tf}]: {len(df)} شمعة — "
-                                f"آخر سعر {df['close'].iloc[-1]:.4g}"
-                            )
-                    with ohlcv_cache_lock:
-                        cache_keys = len(ohlcv_cache)
-                    results.append(f"\n💾 الكاش: {cache_keys} مفتاح")
-                    results.append(f"⚡ سريع: {'✅' if fast_prefetch_done.is_set() else '⏳'}")
-                    results.append(f"📦 كامل: {'✅' if prefetch_done.is_set() else '⏳'}")
-                    send_telegram("🧪 <b>نتيجة اختبار KuCoin:</b>\n" + "\n".join(results), chat_id)
-                elif txt == "/reload":
-                    send_telegram("🔄 جاري إعادة تحميل الكاش...", chat_id)
-                    with symbols_cache_lock:
-                        syms = list(symbols_cache)
-                    if not syms:
-                        send_telegram("⚠️ لا توجد عملات في القائمة.", chat_id)
-                    else:
-                        fast_prefetch_done.clear()
-                        prefetch_done.clear()
-                        threading.Thread(target=prefetch_all, args=(syms,), daemon=True).start()
-                        send_telegram(f"🚀 بدأ إعادة التحميل لـ {len(syms)} عملة...", chat_id)
-                elif txt == "/help":
-                    send_telegram(
-                        "📋 <b>الأوامر المتاحة:</b>\n"
-                        "1️⃣  <code>1</code> — إشارات اليوم\n"
-                        "2️⃣  <code>2</code> — إشارات أمس\n"
-                        "3️⃣  <code>3</code> — آخر 7 أيام\n"
-                        "📊  <code>/status</code> — حالة البوت والكاش\n"
-                        "🔬  <code>/cache</code> — فحص الكاش\n"
-                        "🧪  <code>/fetchtest</code> — اختبار اتصال KuCoin\n"
-                        "🔄  <code>/reload</code> — إعادة تحميل الكاش\n"
-                        "🔍  <code>/سبب</code> — تشخيص غياب الإشارات\n"
-                        "📋  <code>/help</code> — قائمة الأوامر",
-                        chat_id,
-                    )
-
-        except requests.exceptions.Timeout:
-            log.warning("⏱️ getUpdates timeout — إعادة المحاولة...")
-        except Exception as e:
-            log.error(f"❌ Polling error: {e}")
-            time.sleep(10)
-
-def _parse_klines(resp) -> pd.DataFrame:
+# ──────────────────────────────────────────────
+# OHLCV
+# ──────────────────────────────────────────────
+def _parse_klines(resp):
     df = pd.DataFrame(resp, columns=["ts","open","close","high","low","vol","turnover"])
-    for c in ["open","high","low","close","vol"]:
-        df[c] = df[c].astype(float)
+    for c in ["open","high","low","close","vol"]: df[c] = df[c].astype(float)
     df["ts"] = pd.to_datetime(df["ts"].astype(int), unit="s", utc=True)
-    df = df.sort_values("ts").reset_index(drop=True)
-    return df[["ts","open","high","low","close","vol"]]
+    return df.sort_values("ts").reset_index(drop=True)[["ts","open","high","low","close","vol"]]
 
-def get_ohlcv(symbol: str, tf: str, limit: int = 500) -> pd.DataFrame:
+def get_ohlcv(symbol, tf, limit=500):
     kc_sym  = to_kucoin_symbol(symbol)
     kc_tf   = TF_MAP.get(tf, "1min")
     end_sec = int(time.time())
@@ -281,23 +171,18 @@ def get_ohlcv(symbol: str, tf: str, limit: int = 500) -> pd.DataFrame:
             timeout=10,
         ).json()
         data = resp.get("data", [])
-        if data:
-            return _parse_klines(data)
+        if data: return _parse_klines(data)
         log.warning(f"⚠️ رد غير صالح {symbol}/{tf}: {str(resp)[:120]}")
     except Exception as e:
         log.error(f"get_ohlcv {symbol} {tf}: {e}")
     return pd.DataFrame()
 
-def get_ohlcv_full(symbol: str, tf: str, target: int) -> pd.DataFrame:
+def get_ohlcv_full(symbol, tf, target):
     kc_sym  = to_kucoin_symbol(symbol)
     kc_tf   = TF_MAP.get(tf, "1min")
     tf_sec  = 60 if tf == "1m" else 3600
     KUCOIN_MAX = 1500
-    all_dfs  = []
-    end_sec  = int(time.time())
-    fetched  = 0
-    retries  = 0
-
+    all_dfs, end_sec, fetched, retries = [], int(time.time()), 0, 0
     while fetched < target:
         batch     = min(KUCOIN_MAX, target - fetched)
         start_sec = end_sec - batch * tf_sec
@@ -309,48 +194,30 @@ def get_ohlcv_full(symbol: str, tf: str, target: int) -> pd.DataFrame:
                 timeout=15,
             ).json()
             data = resp.get("data", [])
-
             if not data:
-                log.warning(f"⚠️ فارغ {symbol}/{tf}: {str(resp)[:120]}")
                 retries += 1
-                if retries >= 3:
-                    break
-                time.sleep(2 ** retries)
-                continue
-
+                if retries >= 3: break
+                time.sleep(2 ** retries); continue
             df = _parse_klines(data)
             all_dfs.insert(0, df)
-            fetched  += len(df)
-            retries   = 0
-            end_sec   = start_sec - 1
-
-            if len(df) < batch:
-                break
+            fetched += len(df); retries = 0; end_sec = start_sec - 1
+            if len(df) < batch: break
             time.sleep(0.2)
-
         except requests.exceptions.Timeout:
             retries += 1
-            log.warning(f"⏱️ timeout {symbol}/{tf} (محاولة {retries})")
-            if retries >= 3:
-                break
+            if retries >= 3: break
             time.sleep(2 ** retries)
         except Exception as e:
             retries += 1
-            log.error(f"full fetch error {symbol}/{tf} (محاولة {retries}): {e}")
-            if retries >= 3:
-                break
+            log.error(f"full fetch {symbol}/{tf}: {e}")
+            if retries >= 3: break
             time.sleep(2 ** retries)
+    return (pd.concat(all_dfs).drop_duplicates(subset="ts")
+            .sort_values("ts").reset_index(drop=True) if all_dfs else pd.DataFrame())
 
-    return (
-        pd.concat(all_dfs).drop_duplicates(subset="ts").sort_values("ts").reset_index(drop=True)
-        if all_dfs else pd.DataFrame()
-    )
-
-def cache_merge(symbol: str, tf: str, new_df: pd.DataFrame):
-    if new_df.empty:
-        return
-    key  = (symbol, tf)
-    maxc = CACHE_MAX_CANDLES.get(tf, 5000)
+def cache_merge(symbol, tf, new_df):
+    if new_df.empty: return
+    key = (symbol, tf); maxc = CACHE_MAX_CANDLES.get(tf, 5000)
     with ohlcv_cache_lock:
         old = ohlcv_cache.get(key)
         if old is not None and not old.empty:
@@ -359,18 +226,18 @@ def cache_merge(symbol: str, tf: str, new_df: pd.DataFrame):
         else:
             ohlcv_cache[key] = new_df.tail(maxc).reset_index(drop=True)
 
-def get_cached(symbol: str, tf: str) -> pd.DataFrame:
+def get_cached(symbol, tf):
     with ohlcv_cache_lock:
         df = ohlcv_cache.get((symbol, tf))
     return df.copy() if df is not None else pd.DataFrame()
 
-def prefetch_all(symbols: list):
+# ──────────────────────────────────────────────
+# Prefetch & Cache Update
+# ──────────────────────────────────────────────
+def prefetch_all(symbols):
     total = len(symbols)
-
-    log.info(f"⚡ المرحلة الأولى (سريعة): {total} عملة | 1m→3500 | 60m→250")
-    fast_success = 0
-    fast_failed  = 0
-
+    log.info(f"⚡ المرحلة الأولى (سريعة): {total} عملة")
+    fast_success = fast_failed = 0
     for i, sym in enumerate(symbols):
         for tf, n in FAST_FETCH_CANDLES.items():
             fetched = False
@@ -379,61 +246,42 @@ def prefetch_all(symbols: list):
                     df = get_ohlcv_full(sym, tf, target=n)
                     if not df.empty:
                         cache_merge(sym, tf, df)
-                        fast_success += 1
-                        fetched = True
-                        break
-                    else:
-                        log.warning(f"⚠️ سريع فارغ: {sym} [{tf}] (محاولة {attempt+1})")
-                        time.sleep(0.5 * (attempt + 1))
+                        fast_success += 1; fetched = True; break
+                    time.sleep(0.5 * (attempt + 1))
                 except Exception as e:
-                    log.error(f"fast prefetch {sym} {tf} (محاولة {attempt+1}): {e}")
-                    time.sleep(1 * (attempt + 1))
-
-            if not fetched:
-                fast_failed += 1
-                log.warning(f"❌ فشل نهائي (سريع): {sym} [{tf}]")
-
+                    log.error(f"fast prefetch {sym} {tf} ({attempt+1}): {e}")
+                    time.sleep(attempt + 1)
+            if not fetched: fast_failed += 1
             time.sleep(0.2)
-
         if (i + 1) % 10 == 0 or i == total - 1:
             log.info(f"⚡ سريع: {i+1}/{total} | نجح: {fast_success} | فشل: {fast_failed}")
 
     with ohlcv_cache_lock:
         fast_cache_size = len(ohlcv_cache)
-        filled_1m = sum(
-            1 for sym in symbols
-            if (sym, "1m") in ohlcv_cache and not ohlcv_cache[(sym, "1m")].empty
-        )
+        filled_1m = sum(1 for s in symbols
+                        if (s, "1m") in ohlcv_cache and not ohlcv_cache[(s, "1m")].empty)
 
     if fast_cache_size == 0:
-        log.error("❌ الكاش السريع فارغ! KuCoin API فشل.")
-        send_telegram(
-            "❌ <b>فشل التحميل السريع!</b>\n"
-            "KuCoin API لا يستجيب.\n"
-            "💡 استخدم /fetchtest للتشخيص\n"
-            "🔄 أرسل /reload للمحاولة مجدداً"
-        )
+        log.error("❌ الكاش السريع فارغ!")
+        send_telegram("❌ <b>فشل التحميل السريع!</b>\n💡 استخدم /fetchtest\n🔄 أرسل /reload")
         return
 
     fast_prefetch_done.set()
-    log.info(f"✅ المرحلة الأولى اكتملت | كاش: {fast_cache_size} | مكتملة 1m: {filled_1m}/{total}")
+    log.info(f"✅ المرحلة الأولى اكتملت | كاش: {fast_cache_size}")
     send_telegram(
         f"⚡ <b>التحميل السريع اكتمل — الإشارات بدأت!</b>\n"
         f"📈 عملات: {total} | ✅ مكتملة: {filled_1m} | 💾 مفاتيح: {fast_cache_size}\n"
         f"❌ فشل: {fast_failed} | 📦 جاري تحميل البيانات الكاملة..."
     )
 
-    log.info(f"📦 المرحلة الثانية (كاملة): {total} عملة…")
+    log.info(f"📦 المرحلة الثانية (كاملة): {total} عملة")
     full_success = 0
     for i, sym in enumerate(symbols):
         for tf, n in API_FETCH_CANDLES.items():
             try:
                 df = get_ohlcv_full(sym, tf, target=n)
                 if not df.empty:
-                    cache_merge(sym, tf, df)
-                    full_success += 1
-                else:
-                    log.warning(f"⚠️ كامل فارغ: {sym} [{tf}]")
+                    cache_merge(sym, tf, df); full_success += 1
                 time.sleep(0.2)
             except Exception as e:
                 log.error(f"full prefetch {sym} {tf}: {e}")
@@ -448,21 +296,17 @@ def prefetch_all(symbols: list):
     diag_lines = ["🔬 <b>عينة من الكاش:</b>"]
     for (sym, tf), df in sample:
         diag_lines.append(f"• {sym} [{tf}]: {len(df)} شمعة")
-
-    log.info(f"✅ التحميل الكامل اكتمل | كاش: {full_cache_size} مفتاح")
     send_telegram(
         f"✅ <b>التحميل الكامل اكتمل</b>\n"
         f"📈 عملات: {total} | 💾 مفاتيح: {full_cache_size}\n"
-        f"✔️ نجح: {full_success}/{total*2}\n\n" +
-        "\n".join(diag_lines)
+        f"✔️ نجح: {full_success}/{total*2}\n\n" + "\n".join(diag_lines)
     )
 
 def _update_batch(symbols, tf, limit):
     for sym in symbols:
         try:
             df = get_ohlcv(sym, tf, limit=limit)
-            if not df.empty:
-                cache_merge(sym, tf, df)
+            if not df.empty: cache_merge(sym, tf, df)
             time.sleep(0.15)
         except Exception as e:
             log.error(f"update {sym} {tf}: {e}")
@@ -471,35 +315,102 @@ def cache_updater_1m():
     while True:
         time.sleep(45)
         if fast_prefetch_done.is_set():
-            with symbols_cache_lock:
-                syms = list(symbols_cache)
-            if syms:
-                _update_batch(syms, "1m", limit=15)
+            with symbols_cache_lock: syms = list(symbols_cache)
+            if syms: _update_batch(syms, "1m", limit=15)
 
 def cache_updater_60m():
     while True:
         time.sleep(45 * 60)
         if fast_prefetch_done.is_set():
-            with symbols_cache_lock:
-                syms = list(symbols_cache)
-            if syms:
-                _update_batch(syms, "60m", limit=5)
+            with symbols_cache_lock: syms = list(symbols_cache)
+            if syms: _update_batch(syms, "60m", limit=5)
 
-def resample_ohlcv(df: pd.DataFrame, minutes: int) -> pd.DataFrame:
-    if df.empty or minutes <= 0:
-        return pd.DataFrame()
+# ──────────────────────────────────────────────
+# Resample
+# ──────────────────────────────────────────────
+def resample_ohlcv(df, minutes):
+    if df.empty or minutes <= 0: return pd.DataFrame()
     try:
-        r = (
-            df.copy().set_index("ts")
-            .resample(f"{minutes}min", closed="left", label="left", origin=EPOCH)
-            .agg({"open":"first","high":"max","low":"min","close":"last","vol":"sum"})
-            .dropna()
-        )
+        r = (df.copy().set_index("ts")
+             .resample(f"{minutes}min", closed="left", label="left", origin=EPOCH)
+             .agg({"open":"first","high":"max","low":"min","close":"last","vol":"sum"})
+             .dropna())
         return r.iloc[:-1].reset_index()
     except Exception as e:
         log.error(f"resample error: {e}")
         return pd.DataFrame()
 
+# ──────────────────────────────────────────────
+# ✅ المؤشرات المصححة
+# ──────────────────────────────────────────────
+
+# 1. MACD أخضر على فريم التأكيد (×3)
+def check_macd_green(df):
+    if len(df) < 35: return False
+    c   = df["close"]
+    ml  = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
+    sig = ml.ewm(span=9, adjust=False).mean()
+    return bool((ml - sig).iloc[-1] > 0)
+
+# 2. MACD أحمر بسيط على الفريم الرئيسي ✅ مصحح
+def check_macd_red(df):
+    if len(df) < 35: return False
+    c   = df["close"]
+    ml  = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
+    sig = ml.ewm(span=9, adjust=False).mean()
+    return bool((ml - sig).iloc[-1] < 0)
+
+# 3. Donchian Trend Ribbon — منطق LonesomeTheBlue ✅ مصحح
+def _dchannel_trend(closes, hh_prev, ll_prev):
+    """حساب اتجاه Donchian بكفاءة عالية"""
+    n = len(closes)
+    trend = np.zeros(n, dtype=np.int8)
+    for i in range(1, n):
+        if np.isnan(hh_prev[i]) or np.isnan(ll_prev[i]):
+            trend[i] = 0
+        elif closes[i] > hh_prev[i]:
+            trend[i] = 1
+        elif closes[i] < ll_prev[i]:
+            trend[i] = -1
+        else:
+            trend[i] = trend[i - 1]
+    return trend
+
+def check_donchian_ribbon(df, length=20, direction="green"):
+    """
+    Donchian Trend Ribbon:
+    - الاتجاه الرئيسي بـ length
+    - 9 فترات فرعية (length-1 ... length-9)
+    - أخضر: الرئيسي صاعد + 5 على الأقل من الفرعية صاعدة
+    - أحمر: الرئيسي هابط + 5 على الأقل من الفرعية هابطة
+    """
+    min_len = length + 2
+    if len(df) < min_len: return False
+
+    closes = df["close"].values
+    highs  = df["high"].values
+    lows   = df["low"].values
+
+    def get_trend(ln):
+        hh = pd.Series(highs).rolling(ln).max().shift(1).values
+        ll = pd.Series(lows).rolling(ln).min().shift(1).values
+        return int(_dchannel_trend(closes, hh, ll)[-1])
+
+    main_trend = get_trend(length)
+    sub_trends = [get_trend(l) for l in range(length - 1, max(length - 10, 4), -1)]
+
+    if direction == "green":
+        return main_trend == 1 and sum(t == 1 for t in sub_trends) >= 5
+    else:
+        return main_trend == -1 and sum(t == -1 for t in sub_trends) >= 5
+
+# 4. EMA50 — إغلاق تحت الخط ✅ صح كما هو
+def check_ema50_below(df):
+    if len(df) < 50: return False
+    ema = df["close"].ewm(span=50, adjust=False).mean()
+    return bool(df["close"].iloc[-1] < ema.iloc[-1])
+
+# 5. SMI — إعدادات TradingView (k=10, d=3, ema=10, smooth=1, threshold=-40) ✅ صح
 def calc_smi(high, low, close, k=10, d=3, ema=10, smooth=1):
     hh  = high.rolling(k).max()
     ll  = low.rolling(k).min()
@@ -507,109 +418,65 @@ def calc_smi(high, low, close, k=10, d=3, ema=10, smooth=1):
     ds  = (close - mid).ewm(span=d, adjust=False).mean().ewm(span=d, adjust=False).mean()
     hls = ((hh - ll) / 2).ewm(span=d, adjust=False).mean().ewm(span=d, adjust=False).mean()
     smi = 200 * ds / (hls.abs() + 1e-10)
-    if smooth > 1:
-        smi = smi.rolling(smooth).mean()
+    if smooth > 1: smi = smi.rolling(smooth).mean()
     sig = smi.ewm(span=ema, adjust=False).mean()
     return smi, sig
 
-def check_smi_oversold(df: pd.DataFrame, threshold=-40, lookback=5) -> bool:
-    if len(df) < 30:
-        return False
+def check_smi_oversold(df, threshold=-40, lookback=5):
+    if len(df) < 30: return False
     smi, _ = calc_smi(df["high"], df["low"], df["close"])
     return bool(smi.iloc[-lookback:].min() <= threshold)
 
-def check_macd_green(df: pd.DataFrame) -> bool:
-    if len(df) < 35:
-        return False
-    c   = df["close"]
-    ml  = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
-    sig = ml.ewm(span=9, adjust=False).mean()
-    return bool((ml - sig).iloc[-1] > 0)
-
-def check_macd_entry(df: pd.DataFrame, entry_min: int) -> bool:
-    if len(df) < 35:
-        return False
-    c    = df["close"]
-    ml   = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
-    sig  = ml.ewm(span=9, adjust=False).mean()
-    hist = ml - sig
-    if hist.iloc[-1] >= 0 or sig.iloc[-1] < 0 or sig.iloc[-1] < hist.iloc[-1]:
-        return False
-    c24  = max(int(1440 / entry_min), 1)
-    peak = ml.iloc[-c24:].max() if len(ml) >= c24 else ml.max()
-    if peak > 0 and ml.iloc[-1] > peak * 0.20:
-        return False
-    return True
-
-def check_donchian(df: pd.DataFrame, period=20, direction="green") -> bool:
-    if len(df) < period:
-        return False
-    hi  = df["high"].rolling(period).max()
-    lo  = df["low"].rolling(period).min()
-    mid = (hi + lo) / 2
-    return (df["close"].iloc[-1] >= mid.iloc[-1]) if direction == "green" else (df["close"].iloc[-1] < mid.iloc[-1])
-
-def check_ema50_below(df: pd.DataFrame) -> bool:
-    if len(df) < 50:
-        return False
-    ema = df["close"].ewm(span=50, adjust=False).mean()
-    return bool(df["close"].iloc[-1] < ema.iloc[-1])
-
-def wilder_rma(series: pd.Series, period: int) -> pd.Series:
+# 6. RSI + Stochastic على فريم الدخول (÷3) ✅ صح
+def wilder_rma(series, period):
     return series.ewm(alpha=1/period, adjust=False).mean()
 
-def calc_rsi_tv(close: pd.Series, period: int = 14) -> pd.Series:
+def calc_rsi_tv(close, period=14):
     delta = close.diff()
     gain  = delta.clip(lower=0)
     loss  = (-delta.clip(upper=0))
-    avg_g = wilder_rma(gain, period)
-    avg_l = wilder_rma(loss, period)
-    rs    = avg_g / (avg_l + 1e-10)
-    return 100 - (100 / (1 + rs))
+    return 100 - (100 / (1 + wilder_rma(gain, period) / (wilder_rma(loss, period) + 1e-10)))
 
-def check_rsi_stoch(df: pd.DataFrame, lookback=5) -> bool:
-    if len(df) < 50:
-        return False
+def check_rsi_stoch(df, lookback=5):
+    if len(df) < 50: return False
     close, high, low = df["close"], df["high"], df["low"]
     rsi    = calc_rsi_tv(close, period=14)
     rsi_ma = rsi.rolling(14).mean()
-    if rsi.iloc[-20:].min() > 35:
-        return False
+    if rsi.iloc[-20:].min() > 35: return False
     rsi_cross = any(
         rsi.iloc[i-1] < rsi_ma.iloc[i-1] and rsi.iloc[i] >= rsi_ma.iloc[i]
         for i in range(-10, 0)
     )
-    if not rsi_cross:
-        return False
+    if not rsi_cross: return False
     lo15  = low.rolling(15).min()
     hi15  = high.rolling(15).max()
     k_raw = 100 * (close - lo15) / (hi15 - lo15 + 1e-10)
     k     = k_raw.rolling(3).mean()
     return any(k.iloc[i-1] < 20 and k.iloc[i] >= 20 for i in range(-lookback, 0))
 
+# ──────────────────────────────────────────────
+# Diagnostics
+# ──────────────────────────────────────────────
 DIAG_LABELS = {
     "no_data"         : "بيانات ناقصة",
-    "macd_confirm"    : "MACD Confirm مش أخضر",
-    "donchian_confirm": "Donchian Confirm مش مناسب",
-    "smi_oversold"    : "SMI مش في منطقة التشبع البيعي",
-    "macd_entry"      : "MACD Entry شروطه ما اتحققت",
-    "donchian_entry"  : "Donchian Entry مش أخضر",
+    "macd_confirm"    : "MACD Confirm مش أخضر (×3)",
+    "donchian_confirm": "Donchian Ribbon Confirm مش أخضر",
+    "macd_red"        : "MACD الرئيسي مش أحمر",
+    "donchian_entry"  : "Donchian Ribbon الرئيسي مش أخضر",
     "ema50"           : "السعر فوق EMA50",
+    "smi_oversold"    : "SMI مش في التشبع البيعي",
     "rsi_stoch"       : "RSI/Stochastic ما اتحقق",
-    "donchian_third"  : "Donchian Third مش أحمر",
 }
 
-def build_diag_msg(reset: bool = False) -> str:
+def build_diag_msg(reset=False):
     with diag_lock:
-        t         = diag_counts["total"] or 1
+        t = diag_counts["total"] or 1
         non_total = {k: v for k, v in diag_counts.items() if k not in ["total", "passed"]}
-        worst_k   = max(non_total, key=lambda k: non_total[k])
-        worst_v   = non_total[worst_k]
+        worst_k = max(non_total, key=lambda k: non_total[k])
+        worst_v = non_total[worst_k]
         lines = [
-            "🔍 <b>تقرير التشخيص</b>",
-            "━━━━━━━━━━━━━━━",
-            f"📊 إجمالي الفحوصات: <b>{t}</b>",
-            "",
+            "🔍 <b>تقرير التشخيص</b>", "━━━━━━━━━━━━━━━",
+            f"📊 إجمالي الفحوصات: <b>{t}</b>", "",
         ]
         for k, label in DIAG_LABELS.items():
             count = diag_counts[k]
@@ -617,14 +484,12 @@ def build_diag_msg(reset: bool = False) -> str:
             bar   = "█" * (pct // 10) + "░" * (10 - pct // 10)
             lines.append(f"❌ {label}\n    {bar} {count} ({pct}%)")
         lines += [
-            "",
-            f"✅ اجتازت الكل: <b>{diag_counts['passed']}</b>",
+            "", f"✅ اجتازت الكل: <b>{diag_counts['passed']}</b>",
             "━━━━━━━━━━━━━━━",
             f"🏆 أكثر سبب فشل: <b>{DIAG_LABELS.get(worst_k, worst_k)}</b> ({worst_v})",
         ]
         if reset:
-            for k in diag_counts:
-                diag_counts[k] = 0
+            for k in diag_counts: diag_counts[k] = 0
     return "\n".join(lines)
 
 def send_diag_report():
@@ -632,6 +497,9 @@ def send_diag_report():
         time.sleep(3600)
         send_telegram(build_diag_msg(reset=True))
 
+# ──────────────────────────────────────────────
+# ✅ scan_symbol المصحح — الترتيب الصحيح
+# ──────────────────────────────────────────────
 def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
     raw_ec = get_cached(symbol, ec_api)
     raw_t  = get_cached(symbol, t_api)
@@ -640,13 +508,10 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
         log.info(f"🔍 كاش | {symbol} | ec[{ec_api}]={len(raw_ec)} | t[{t_api}]={len(raw_t)}")
         cache_diag_logged.set()
 
-    with diag_lock:
-        diag_counts["total"] += 1
+    with diag_lock: diag_counts["total"] += 1
 
     if raw_ec.empty or len(raw_ec) < 50 or raw_t.empty or len(raw_t) < 50:
-        with diag_lock:
-            diag_counts["no_data"] += 1
-        log.debug(f"no_data: {symbol} | ec[{ec_api}]={len(raw_ec)} | t[{t_api}]={len(raw_t)}")
+        with diag_lock: diag_counts["no_data"] += 1
         return
 
     df_entry   = resample_ohlcv(raw_ec, entry_min)
@@ -654,64 +519,69 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
     df_third   = resample_ohlcv(raw_t,  third_min)
 
     if any(d.empty or len(d) < 25 for d in [df_entry, df_confirm, df_third]):
-        with diag_lock:
-            diag_counts["no_data"] += 1
+        with diag_lock: diag_counts["no_data"] += 1
         return
 
+    # ① فريم التأكيد (×3): MACD أخضر + Donchian Ribbon أخضر
     if not check_macd_green(df_confirm):
         with diag_lock: diag_counts["macd_confirm"] += 1
         return
-    if not check_donchian(df_confirm, direction="green"):
+
+    if not check_donchian_ribbon(df_confirm, direction="green"):
         with diag_lock: diag_counts["donchian_confirm"] += 1
         return
-    if not check_smi_oversold(df_entry):
-        with diag_lock: diag_counts["smi_oversold"] += 1
+
+    # ② الفريم الرئيسي: MACD أحمر + Ribbon أخضر + EMA50 + SMI
+    if not check_macd_red(df_entry):
+        with diag_lock: diag_counts["macd_red"] += 1
         return
-    if not check_macd_entry(df_entry, entry_min):
-        with diag_lock: diag_counts["macd_entry"] += 1
-        return
-    if not check_donchian(df_entry, direction="green"):
+
+    if not check_donchian_ribbon(df_entry, direction="green"):
         with diag_lock: diag_counts["donchian_entry"] += 1
         return
+
     if not check_ema50_below(df_entry):
         with diag_lock: diag_counts["ema50"] += 1
         return
+
+    if not check_smi_oversold(df_entry):
+        with diag_lock: diag_counts["smi_oversold"] += 1
+        return
+
+    # ③ فريم الدخول (÷3): RSI تقاطع + Stochastic > 20
     if not check_rsi_stoch(df_third):
         with diag_lock: diag_counts["rsi_stoch"] += 1
         return
-    if not check_donchian(df_third, direction="red"):
-        with diag_lock: diag_counts["donchian_third"] += 1
-        return
 
-    with diag_lock:
-        diag_counts["passed"] += 1
+    # ✅ كل الشروط اتحققت
+    with diag_lock: diag_counts["passed"] += 1
 
     last_ts = df_entry["ts"].iloc[-1].strftime("%Y%m%d%H%M") if "ts" in df_entry.columns else "x"
     key = f"{symbol}_{entry_min}_{last_ts}"
 
     with alerted_keys_lock:
-        if key in alerted_keys:
-            return
+        if key in alerted_keys: return
         alerted_keys[key] = datetime.now(timezone.utc)
 
-    price   = df_entry["close"].iloc[-1]
-    now_utc = datetime.now(timezone.utc)
-    # وقت إغلاق الشمعة بتوقيت UTC
+    price       = df_entry["close"].iloc[-1]
+    now_utc     = datetime.now(timezone.utc)
     candle_time = df_entry["ts"].iloc[-1].strftime("%Y-%m-%d %H:%M UTC")
-    # وقت الإشارة بتوقيت UTC
     signal_time = now_utc.strftime("%Y-%m-%d %H:%M UTC")
 
     save_signal(symbol, price, entry_min, confirm_min, third_min)
     send_telegram(
         f"🚨 <b>إشارة دخول</b>\n"
         f"🪙 <b>{symbol}</b>\n"
-        f"🎯 الدخول: <b>{entry_min}m</b>\n"
+        f"🎯 الدخول: <b>{entry_min}m</b> | تأكيد: {confirm_min}m | ثالث: {third_min}m\n"
         f"💰 السعر: {price:.6g}\n"
         f"🕯️ إغلاق الشمعة: {candle_time}\n"
         f"🕐 وقت الإشارة: {signal_time}"
     )
 
-def get_next_close(tf_minutes: int) -> datetime:
+# ──────────────────────────────────────────────
+# Candle Watcher
+# ──────────────────────────────────────────────
+def get_next_close(tf_minutes):
     now   = datetime.now(timezone.utc)
     epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
     total = int((now - epoch).total_seconds() / 60)
@@ -723,12 +593,9 @@ def candle_watcher(entry_min, confirm_min, third_min, ec_api, t_api):
         wait = (nxt - datetime.now(timezone.utc)).total_seconds()
         time.sleep(max(wait, 0) + 2.0)
         cleanup_alerted_keys()
-        if not fast_prefetch_done.is_set():
-            continue
-        with symbols_cache_lock:
-            syms = list(symbols_cache)
-        if not syms:
-            continue
+        if not fast_prefetch_done.is_set(): continue
+        with symbols_cache_lock: syms = list(symbols_cache)
+        if not syms: continue
         cache_diag_logged.clear()
         fn = partial(
             scan_symbol,
@@ -738,72 +605,152 @@ def candle_watcher(entry_min, confirm_min, third_min, ec_api, t_api):
         with ThreadPoolExecutor(max_workers=4) as ex:
             ex.map(fn, syms)
 
+# ──────────────────────────────────────────────
+# Telegram Commands
+# ──────────────────────────────────────────────
+def poll_telegram_commands():
+    last_id = 0
+    log.info("📡 بدء الاستماع لأوامر التلقرام…")
+    while True:
+        try:
+            r = get_session().get(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+                params={"offset": last_id + 1, "timeout": 30},
+                timeout=35,
+            ).json()
+            if not r.get("ok"):
+                time.sleep(5); continue
+            for upd in r.get("result", []):
+                last_id = upd["update_id"]
+                msg     = upd.get("message", {})
+                txt     = msg.get("text", "").strip()
+                chat_id = str(msg.get("chat", {}).get("id", ""))
+                if not txt or not chat_id: continue
+                log.info(f"📩 أمر: '{txt}' من {chat_id}")
+
+                if txt == "1":   send_telegram(get_report("today"), chat_id)
+                elif txt == "2": send_telegram(get_report("yesterday"), chat_id)
+                elif txt == "3": send_telegram(get_report("week"), chat_id)
+                elif txt in ("/سبب", "/diag"):
+                    send_telegram(
+                        "⚠️ لا توجد بيانات." if diag_counts["total"] == 0
+                        else build_diag_msg(reset=False), chat_id
+                    )
+                elif txt == "/status":
+                    with trades_lock:       cnt    = len(trades_history)
+                    with alerted_keys_lock: active = len(alerted_keys)
+                    with ohlcv_cache_lock:  keys   = len(ohlcv_cache)
+                    send_telegram(
+                        f"🤖 البوت يعمل — KuCoin API\n"
+                        f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
+                        f"📊 إجمالي الإشارات: {cnt}\n"
+                        f"🔑 تنبيهات نشطة: {active}\n"
+                        f"💾 الكاش: {keys} مفتاح\n"
+                        f"⚡ تحميل سريع: {'✅' if fast_prefetch_done.is_set() else '⏳'}\n"
+                        f"📦 تحميل كامل: {'✅' if prefetch_done.is_set() else '⏳'}",
+                        chat_id,
+                    )
+                elif txt == "/cache":
+                    with ohlcv_cache_lock:
+                        sample = list(ohlcv_cache.items())[:5]
+                        total_keys = len(ohlcv_cache)
+                    lines = [f"🔬 <b>الكاش ({total_keys} مفتاح):</b>"]
+                    for (sym, tf), df in sample:
+                        lines.append(f"• {sym} [{tf}]: {len(df)} شمعة")
+                    send_telegram("\n".join(lines), chat_id)
+                elif txt == "/fetchtest":
+                    send_telegram("🔄 جاري اختبار KuCoin API...", chat_id)
+                    results = []
+                    for tf in ["1m", "60m"]:
+                        df = get_ohlcv("BTCUSDT", tf, limit=10)
+                        results.append(
+                            f"✅ BTCUSDT [{tf}]: {len(df)} شمعة — آخر سعر {df['close'].iloc[-1]:.4g}"
+                            if not df.empty else f"❌ BTCUSDT [{tf}]: فشل"
+                        )
+                    with ohlcv_cache_lock: cache_keys = len(ohlcv_cache)
+                    results += [f"💾 الكاش: {cache_keys} مفتاح",
+                                f"⚡ {'✅' if fast_prefetch_done.is_set() else '⏳'}"]
+                    send_telegram("🧪 <b>نتيجة اختبار KuCoin:</b>\n" + "\n".join(results), chat_id)
+                elif txt == "/reload":
+                    with symbols_cache_lock: syms = list(symbols_cache)
+                    if not syms:
+                        send_telegram("⚠️ لا توجد عملات.", chat_id)
+                    else:
+                        fast_prefetch_done.clear(); prefetch_done.clear()
+                        threading.Thread(target=prefetch_all, args=(syms,), daemon=True).start()
+                        send_telegram(f"🚀 بدأ إعادة التحميل لـ {len(syms)} عملة...", chat_id)
+                elif txt == "/help":
+                    send_telegram(
+                        "📋 <b>الأوامر المتاحة:</b>\n"
+                        "1️⃣  <code>1</code> — إشارات اليوم\n"
+                        "2️⃣  <code>2</code> — إشارات أمس\n"
+                        "3️⃣  <code>3</code> — آخر 7 أيام\n"
+                        "📊  <code>/status</code> — حالة البوت\n"
+                        "🔬  <code>/cache</code> — فحص الكاش\n"
+                        "🧪  <code>/fetchtest</code> — اختبار KuCoin\n"
+                        "🔄  <code>/reload</code> — إعادة تحميل الكاش\n"
+                        "🔍  <code>/سبب</code> — تشخيص الإشارات\n"
+                        "📋  <code>/help</code> — قائمة الأوامر",
+                        chat_id,
+                    )
+        except requests.exceptions.Timeout:
+            log.warning("⏱️ getUpdates timeout")
+        except Exception as e:
+            log.error(f"Polling error: {e}")
+            time.sleep(10)
+
+# ──────────────────────────────────────────────
+# Symbols Loop
+# ──────────────────────────────────────────────
 def update_symbols_loop():
     first = True
     while True:
         try:
-            log.info("🔄 جاري جلب قائمة العملات من KuCoin...")
             resp = get_session().get(
-                f"{KUCOIN_BASE}/api/v1/market/allTickers",
-                timeout=20,
+                f"{KUCOIN_BASE}/api/v1/market/allTickers", timeout=20,
             ).json()
-
             tickers = resp.get("data", {}).get("ticker", [])
-            log.info(f"📦 KuCoin tickers: {len(tickers)}")
-
             if tickers:
                 top = sorted(
                     [t for t in tickers if t["symbol"].endswith("-USDT")],
-                    key=lambda x: float(x.get("volValue", 0)),
-                    reverse=True,
+                    key=lambda x: float(x.get("volValue", 0)), reverse=True,
                 )[:TOP_SYMBOLS_LIMIT]
                 new_syms = [from_kucoin_symbol(t["symbol"]) for t in top]
                 with symbols_cache_lock:
-                    symbols_cache.clear()
-                    symbols_cache.extend(new_syms)
-                log.info(f"✅ تحديث العملات: {len(new_syms)} عملة — أول 5: {new_syms[:5]}")
+                    symbols_cache.clear(); symbols_cache.extend(new_syms)
+                log.info(f"✅ عملات: {len(new_syms)} — أول 5: {new_syms[:5]}")
                 if first:
                     first = False
                     threading.Thread(target=prefetch_all, args=(list(new_syms),), daemon=True).start()
             else:
-                log.error(f"❌ KuCoin رد غير متوقع: {str(resp)[:300]}")
-                if first:
-                    _start_fallback()
-                    first = False
-
+                if first: _start_fallback(); first = False
         except Exception as e:
-            log.error(f"❌ Symbols loop error: {e}")
-            if first:
-                _start_fallback()
-                first = False
-
+            log.error(f"Symbols loop error: {e}")
+            if first: _start_fallback(); first = False
         time.sleep(3600)
 
 def _start_fallback():
-    fallback = [
-        "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT",
-        "DOGEUSDT","ADAUSDT","AVAXUSDT","DOTUSDT","MATICUSDT",
-        "LINKUSDT","UNIUSDT","LTCUSDT","ATOMUSDT","NEARUSDT",
-    ]
+    fallback = ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT",
+                "DOGEUSDT","ADAUSDT","AVAXUSDT","DOTUSDT","MATICUSDT",
+                "LINKUSDT","UNIUSDT","LTCUSDT","ATOMUSDT","NEARUSDT"]
     with symbols_cache_lock:
-        symbols_cache.clear()
-        symbols_cache.extend(fallback)
+        symbols_cache.clear(); symbols_cache.extend(fallback)
     log.warning(f"⚠️ fallback: {len(fallback)} عملة")
     threading.Thread(target=prefetch_all, args=(list(fallback),), daemon=True).start()
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
+        self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
     def log_message(self, *_): pass
 
+# ──────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────
 def main():
-    log.info(f"🚀 Tripling Strategy Bot — KuCoin API | {KUCOIN_BASE}")
+    log.info("🚀 Tripling Strategy Bot — KuCoin API (نسخة مصححة)")
     delete_webhook()
     threading.Thread(target=update_symbols_loop, daemon=True).start()
-    while not symbols_cache:
-        time.sleep(1)
+    while not symbols_cache: time.sleep(1)
     threading.Thread(target=poll_telegram_commands, daemon=True).start()
     threading.Thread(target=cache_updater_1m,       daemon=True).start()
     threading.Thread(target=cache_updater_60m,      daemon=True).start()
@@ -812,21 +759,17 @@ def main():
         target=lambda: HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever(),
         daemon=True,
     ).start()
-
     log.info("⏳ انتظار اكتمال التحميل السريع…")
     fast_prefetch_done.wait()
     log.info("✅ بدء الواتشرز")
-
     for entry_min, confirm_min, third_min, ec_api, t_api in TRIPLING_PAIRS:
         threading.Thread(
             target=candle_watcher,
             args=(entry_min, confirm_min, third_min, ec_api, t_api),
             daemon=True,
         ).start()
-
     log.info("✅ جميع الواتشرز تعمل.")
-    while True:
-        time.sleep(60)
+    while True: time.sleep(60)
 
 if __name__ == "__main__":
     main()
