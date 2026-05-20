@@ -47,6 +47,8 @@ alerted_keys       = {}
 alerted_keys_lock  = threading.Lock()
 trades_history     = deque(maxlen=2000)
 trades_lock        = threading.Lock()
+near_signals       = deque(maxlen=500)
+near_signals_lock  = threading.Lock()
 symbols_cache      = []
 symbols_cache_lock = threading.Lock()
 ohlcv_cache        = {}
@@ -572,6 +574,15 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
     # ⑦ RSI تقاطع + Stochastic على فريم الدخول (÷3)
     if not check_rsi_stoch(df_third):
         with diag_lock: diag_counts["rsi_stoch"] += 1
+        # 🔔 وصلت للشرط السادس — احفظها للمتابعة
+        price = df_entry["close"].iloc[-1]
+        with near_signals_lock:
+            near_signals.append({
+                "time"  : datetime.now(timezone.utc),
+                "symbol": symbol,
+                "price" : price,
+                "tf"    : f"{entry_min}m/{confirm_min}m/{third_min}m",
+            })
         return
 
     # ✅ كل الشروط اتحققت
@@ -657,14 +668,29 @@ def poll_telegram_commands():
                         "⚠️ لا توجد بيانات." if diag_counts["total"] == 0
                         else build_diag_msg(reset=False), chat_id
                     )
+                elif txt == "/top6":
+                    with near_signals_lock:
+                        rows = list(near_signals)[-30:]
+                    if not rows:
+                        send_telegram("⏳ لا توجد عملات وصلت للشرط السادس بعد.", chat_id)
+                    else:
+                        lines = [f"<b>🎯 عملات اجتازت 6 شروط — RSI/Stoch فقط باقي ({len(rows)}):</b>\n" + "━" * 15]
+                        for row in reversed(rows):
+                            lines.append(
+                                f"🔸 {row['symbol']} | {row['tf']} | "
+                                f"{row['price']:.6g} | {row['time'].strftime('%H:%M UTC')}"
+                            )
+                        send_telegram("\n".join(lines), chat_id)
                 elif txt == "/status":
                     with trades_lock:       cnt    = len(trades_history)
                     with alerted_keys_lock: active = len(alerted_keys)
                     with ohlcv_cache_lock:  keys   = len(ohlcv_cache)
+                    with near_signals_lock: near   = len(near_signals)
                     send_telegram(
                         f"🤖 البوت يعمل — KuCoin API\n"
                         f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
                         f"📊 إجمالي الإشارات: {cnt}\n"
+                        f"🎯 قريبة من الإشارة (6/7): {near}\n"
                         f"🔑 تنبيهات نشطة: {active}\n"
                         f"💾 الكاش: {keys} مفتاح\n"
                         f"⚡ تحميل سريع: {'✅' if fast_prefetch_done.is_set() else '⏳'}\n"
@@ -706,6 +732,7 @@ def poll_telegram_commands():
                         "1️⃣  <code>1</code> — إشارات اليوم\n"
                         "2️⃣  <code>2</code> — إشارات أمس\n"
                         "3️⃣  <code>3</code> — آخر 7 أيام\n"
+                        "🎯  <code>/top6</code> — عملات اجتازت 6 شروط\n"
                         "📊  <code>/status</code> — حالة البوت\n"
                         "🔬  <code>/cache</code> — فحص الكاش\n"
                         "🧪  <code>/fetchtest</code> — اختبار KuCoin\n"
