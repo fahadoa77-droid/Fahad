@@ -39,8 +39,8 @@ TRIPLING_PAIRS = [
 ]
 
 FAST_FETCH_CANDLES = {"1m": 3500, "60m": 250}
-API_FETCH_CANDLES  = {"1m": 7_680, "60m": 1_500}
-CACHE_MAX_CANDLES  = {"1m": 8_500, "60m": 2_200}
+API_FETCH_CANDLES  = {"1m": 15_000, "60m": 2_000}
+CACHE_MAX_CANDLES  = {"1m": 16_000, "60m": 2_500}
 EPOCH = pd.Timestamp("1970-01-01", tz="UTC")
 
 alerted_keys       = {}
@@ -57,10 +57,14 @@ prefetch_done      = threading.Event()
 
 diag_counts = {
     "total": 0, "no_data": 0,
-    "macd_confirm": 0, "donchian_confirm": 0,
-    "macd_red": 0, "donchian_entry": 0,
-    "ema50": 0, "smi_oversold": 0,
-    "rsi_stoch": 0, "passed": 0,
+    "smi_oversold": 0,
+    "macd_red": 0,
+    "donchian_entry": 0,
+    "donchian_confirm": 0,
+    "macd_confirm": 0,
+    "ema50": 0,
+    "rsi_stoch": 0,
+    "passed": 0,
 }
 diag_lock = threading.Lock()
 cache_diag_logged = threading.Event()
@@ -341,10 +345,10 @@ def resample_ohlcv(df, minutes):
         return pd.DataFrame()
 
 # ──────────────────────────────────────────────
-# ✅ المؤشرات المصححة
+# المؤشرات
 # ──────────────────────────────────────────────
 
-# 1. MACD أخضر على فريم التأكيد (×3)
+# MACD أخضر على فريم التأكيد (×3)
 def check_macd_green(df):
     if len(df) < 35: return False
     c   = df["close"]
@@ -352,7 +356,7 @@ def check_macd_green(df):
     sig = ml.ewm(span=9, adjust=False).mean()
     return bool((ml - sig).iloc[-1] > 0)
 
-# 2. MACD أحمر بسيط على الفريم الرئيسي ✅ مصحح
+# MACD أحمر على الفريم الرئيسي
 def check_macd_red(df):
     if len(df) < 35: return False
     c   = df["close"]
@@ -360,9 +364,8 @@ def check_macd_red(df):
     sig = ml.ewm(span=9, adjust=False).mean()
     return bool((ml - sig).iloc[-1] < 0)
 
-# 3. Donchian Trend Ribbon — منطق LonesomeTheBlue ✅ مصحح
+# Donchian Trend Ribbon
 def _dchannel_trend(closes, hh_prev, ll_prev):
-    """حساب اتجاه Donchian بكفاءة عالية"""
     n = len(closes)
     trend = np.zeros(n, dtype=np.int8)
     for i in range(1, n):
@@ -377,13 +380,6 @@ def _dchannel_trend(closes, hh_prev, ll_prev):
     return trend
 
 def check_donchian_ribbon(df, length=20, direction="green"):
-    """
-    Donchian Trend Ribbon:
-    - الاتجاه الرئيسي بـ length
-    - 9 فترات فرعية (length-1 ... length-9)
-    - أخضر: الرئيسي صاعد + 5 على الأقل من الفرعية صاعدة
-    - أحمر: الرئيسي هابط + 5 على الأقل من الفرعية هابطة
-    """
     min_len = length + 2
     if len(df) < min_len: return False
 
@@ -404,13 +400,13 @@ def check_donchian_ribbon(df, length=20, direction="green"):
     else:
         return main_trend == -1 and sum(t == -1 for t in sub_trends) >= 5
 
-# 4. EMA50 — إغلاق تحت الخط ✅ صح كما هو
+# EMA50
 def check_ema50_below(df):
     if len(df) < 50: return False
     ema = df["close"].ewm(span=50, adjust=False).mean()
     return bool(df["close"].iloc[-1] < ema.iloc[-1])
 
-# 5. SMI — إعدادات TradingView (k=10, d=3, ema=10, smooth=1, threshold=-40) ✅ صح
+# SMI
 def calc_smi(high, low, close, k=10, d=3, ema=10, smooth=1):
     hh  = high.rolling(k).max()
     ll  = low.rolling(k).min()
@@ -427,7 +423,7 @@ def check_smi_oversold(df, threshold=-40, lookback=5):
     smi, _ = calc_smi(df["high"], df["low"], df["close"])
     return bool(smi.iloc[-lookback:].min() <= threshold)
 
-# 6. RSI + Stochastic على فريم الدخول (÷3) ✅ صح
+# RSI + Stochastic
 def wilder_rma(series, period):
     return series.ewm(alpha=1/period, adjust=False).mean()
 
@@ -459,12 +455,12 @@ def check_rsi_stoch(df, lookback=5):
 # ──────────────────────────────────────────────
 DIAG_LABELS = {
     "no_data"         : "بيانات ناقصة",
-    "macd_confirm"    : "MACD Confirm مش أخضر (×3)",
-    "donchian_confirm": "Donchian Ribbon Confirm مش أخضر",
+    "smi_oversold"    : "SMI مش في التشبع البيعي",
     "macd_red"        : "MACD الرئيسي مش أحمر",
     "donchian_entry"  : "Donchian Ribbon الرئيسي مش أخضر",
+    "donchian_confirm": "Donchian Ribbon Confirm مش أخضر",
+    "macd_confirm"    : "MACD Confirm مش أخضر (×3)",
     "ema50"           : "السعر فوق EMA50",
-    "smi_oversold"    : "SMI مش في التشبع البيعي",
     "rsi_stoch"       : "RSI/Stochastic ما اتحقق",
 }
 
@@ -498,7 +494,7 @@ def send_diag_report():
         send_telegram(build_diag_msg(reset=True))
 
 # ──────────────────────────────────────────────
-# ✅ scan_symbol المصحح — الترتيب الصحيح
+# ✅ scan_symbol — الترتيب الجديد
 # ──────────────────────────────────────────────
 def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
     raw_ec = get_cached(symbol, ec_api)
@@ -522,33 +518,37 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
         with diag_lock: diag_counts["no_data"] += 1
         return
 
-    # ① فريم التأكيد (×3): MACD أخضر + Donchian Ribbon أخضر
-    if not check_macd_green(df_confirm):
-        with diag_lock: diag_counts["macd_confirm"] += 1
-        return
-
-    if not check_donchian_ribbon(df_confirm, direction="green"):
-        with diag_lock: diag_counts["donchian_confirm"] += 1
-        return
-
-    # ② الفريم الرئيسي: MACD أحمر + Ribbon أخضر + EMA50 + SMI
-    if not check_macd_red(df_entry):
-        with diag_lock: diag_counts["macd_red"] += 1
-        return
-
-    if not check_donchian_ribbon(df_entry, direction="green"):
-        with diag_lock: diag_counts["donchian_entry"] += 1
-        return
-
-    if not check_ema50_below(df_entry):
-        with diag_lock: diag_counts["ema50"] += 1
-        return
-
+    # ① SMI تشبع بيعي على فريم الدخول
     if not check_smi_oversold(df_entry):
         with diag_lock: diag_counts["smi_oversold"] += 1
         return
 
-    # ③ فريم الدخول (÷3): RSI تقاطع + Stochastic > 20
+    # ② MACD أحمر على فريم الدخول
+    if not check_macd_red(df_entry):
+        with diag_lock: diag_counts["macd_red"] += 1
+        return
+
+    # ③ Donchian Trend Ribbon أخضر على فريم الدخول
+    if not check_donchian_ribbon(df_entry, direction="green"):
+        with diag_lock: diag_counts["donchian_entry"] += 1
+        return
+
+    # ④ Donchian Trend Ribbon أخضر على فريم التأكيد (×3)
+    if not check_donchian_ribbon(df_confirm, direction="green"):
+        with diag_lock: diag_counts["donchian_confirm"] += 1
+        return
+
+    # ⑤ MACD أخضر على فريم التأكيد (×3)
+    if not check_macd_green(df_confirm):
+        with diag_lock: diag_counts["macd_confirm"] += 1
+        return
+
+    # ⑥ EMA50 — السعر تحت الخط
+    if not check_ema50_below(df_entry):
+        with diag_lock: diag_counts["ema50"] += 1
+        return
+
+    # ⑦ RSI تقاطع + Stochastic على فريم الدخول (÷3)
     if not check_rsi_stoch(df_third):
         with diag_lock: diag_counts["rsi_stoch"] += 1
         return
@@ -747,7 +747,7 @@ class HealthHandler(BaseHTTPRequestHandler):
 # Main
 # ──────────────────────────────────────────────
 def main():
-    log.info("🚀 Tripling Strategy Bot — KuCoin API (نسخة مصححة)")
+    log.info("🚀 Tripling Strategy Bot — KuCoin API")
     delete_webhook()
     threading.Thread(target=update_symbols_loop, daemon=True).start()
     while not symbols_cache: time.sleep(1)
