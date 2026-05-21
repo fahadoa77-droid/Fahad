@@ -39,10 +39,8 @@ TRIPLING_PAIRS = [
     (180, 540, 60, "60m","60m"),
 ]
 
-# تسلسل الفريمات من الأصغر للأكبر — كل فريم يلغي الذي يليه فقط
 TIMEFRAME_CHAIN = [9, 12, 15, 18, 21, 24, 27, 30, 45, 60, 90, 120, 180]
 NEXT_TF = {TIMEFRAME_CHAIN[i]: TIMEFRAME_CHAIN[i+1] for i in range(len(TIMEFRAME_CHAIN)-1)}
-# مثال: NEXT_TF[9] = 12, NEXT_TF[12] = 15, ...
 
 FAST_FETCH_CANDLES = {"1m": 3500, "60m": 250}
 API_FETCH_CANDLES  = {"1m": 15_000, "60m": 2_000}
@@ -60,24 +58,25 @@ symbols_cache_lock = threading.Lock()
 ohlcv_cache        = {}
 ohlcv_cache_lock   = threading.Lock()
 
-# ── حالة التشبع البيعي لكل عملة ──────────────────────────────────────────────
-# smi_state[symbol] = entry_min اللي يجب مراقبته حالياً (None = لا يوجد)
 smi_state      = {}
 smi_state_lock = threading.Lock()
 
 fast_prefetch_done = threading.Event()
 prefetch_done      = threading.Event()
 
+# ✅ إضافة "active_skip" لعداد التشخيص
 diag_counts = {
-    "total": 0, "no_data": 0,
-    "smi_oversold": 0,
-    "macd_red": 0,
-    "donchian_entry": 0,
+    "total"          : 0,
+    "no_data"        : 0,
+    "smi_oversold"   : 0,
+    "active_skip"    : 0,   # ← جديد: عدد العملات التي تجاوزها فلتر active
+    "macd_red"       : 0,
+    "donchian_entry" : 0,
     "donchian_confirm": 0,
-    "macd_confirm": 0,
-    "ema50": 0,
-    "rsi_stoch": 0,
-    "passed": 0,
+    "macd_confirm"   : 0,
+    "ema50"          : 0,
+    "rsi_stoch"      : 0,
+    "passed"         : 0,
 }
 diag_lock = threading.Lock()
 cache_diag_logged = threading.Event()
@@ -360,7 +359,6 @@ def resample_ohlcv(df, minutes):
 # ──────────────────────────────────────────────
 # المؤشرات
 # ──────────────────────────────────────────────
-
 def check_macd_green(df):
     if len(df) < 35: return False
     c   = df["close"]
@@ -454,30 +452,22 @@ def check_rsi_stoch(df, lookback=5):
     return any(k.iloc[i-1] < 20 and k.iloc[i] >= 20 for i in range(-lookback, 0))
 
 # ──────────────────────────────────────────────
-# منطق تتابع الفريمات (الجديد)
+# منطق تتابع الفريمات
 # ──────────────────────────────────────────────
 def on_smi_oversold(symbol, entry_min):
-    """
-    لما يصير تشبع بيعي في entry_min:
-    - يلغي الفريم الأكبر التالي فقط (NEXT_TF[entry_min])
-    - يحفظ entry_min كالفريم النشط للعملة
-    """
-    next_tf = NEXT_TF.get(entry_min)  # الفريم الأكبر الذي يُلغى
+    next_tf = NEXT_TF.get(entry_min)
     with smi_state_lock:
         current = smi_state.get(symbol)
-        # لو كان ينتظر فريم أكبر، ألغِه وانزل للأصغر
         if current is None or current >= entry_min:
             smi_state[symbol] = entry_min
             if next_tf:
                 log.info(f"🔄 {symbol}: تشبع بيعي {entry_min}m → ألغى {next_tf}m وبدأ مراقبة {entry_min}m")
 
 def get_active_entry(symbol):
-    """يرجع الـ entry_min النشط للعملة، أو None"""
     with smi_state_lock:
         return smi_state.get(symbol)
 
 def clear_active_entry(symbol):
-    """بعد الإشارة أو انتهاء الصلاحية، امسح الحالة"""
     with smi_state_lock:
         smi_state.pop(symbol, None)
 
@@ -487,6 +477,7 @@ def clear_active_entry(symbol):
 DIAG_LABELS = {
     "no_data"         : "بيانات ناقصة",
     "smi_oversold"    : "SMI مش في التشبع البيعي",
+    "active_skip"     : "الفريم غير نشط (تجاوزه فلتر التسلسل)",   # ← جديد
     "macd_red"        : "MACD الرئيسي مش أحمر",
     "donchian_entry"  : "Donchian Ribbon الرئيسي مش أخضر",
     "donchian_confirm": "Donchian Ribbon Confirm مش أخضر",
@@ -498,6 +489,7 @@ DIAG_LABELS = {
 DIAG_PASS_LABELS = {
     "no_data"         : "بيانات كافية ✅",
     "smi_oversold"    : "SMI في التشبع البيعي ✅",
+    "active_skip"     : "الفريم نشط ومفعّل ✅",                    # ← جديد
     "macd_red"        : "MACD الرئيسي أحمر ✅",
     "donchian_entry"  : "Donchian Ribbon الرئيسي أخضر ✅",
     "donchian_confirm": "Donchian Ribbon Confirm أخضر ✅",
@@ -518,8 +510,8 @@ def build_diag_msg(reset=False):
         ]
         remaining = t
         for k, fail_label in DIAG_LABELS.items():
-            failed  = diag_counts[k]
-            passed  = remaining - failed
+            failed   = diag_counts[k]
+            passed   = remaining - failed
             pass_pct = int(passed / t * 100)
             fail_pct = int(failed / t * 100)
             bar = "█" * (pass_pct // 10) + "░" * (10 - pass_pct // 10)
@@ -543,16 +535,9 @@ def send_diag_report():
         send_telegram(build_diag_msg(reset=True))
 
 # ──────────────────────────────────────────────
-# ✅ scan_symbol — مع منطق تتابع الفريمات
+# ✅ scan_symbol — مع عداد active_skip المُصلح
 # ──────────────────────────────────────────────
 def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
-    """
-    المنطق الجديد:
-    1. دائماً نفحص SMI على فريم entry_min
-    2. لو تشبع بيعي → نسجل الحالة ونلغي الفريم الأكبر التالي
-    3. لو العملة عندها حالة نشطة تساوي entry_min → نكمل باقي الشروط
-    4. لو الحالة النشطة أصغر من entry_min → هذا الواتشر متجاوَز، نتجاهل
-    """
     raw_ec = get_cached(symbol, ec_api)
     raw_t  = get_cached(symbol, t_api)
 
@@ -562,6 +547,7 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
 
     with diag_lock: diag_counts["total"] += 1
 
+    # ① بيانات كافية
     if raw_ec.empty or len(raw_ec) < 50 or raw_t.empty or len(raw_t) < 50:
         with diag_lock: diag_counts["no_data"] += 1
         return
@@ -574,45 +560,46 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
         with diag_lock: diag_counts["no_data"] += 1
         return
 
-    # ① SMI تشبع بيعي — دائماً نفحصه ونحدّث الحالة
+    # ② SMI تشبع بيعي
     smi_ok = check_smi_oversold(df_entry)
     if smi_ok:
         on_smi_oversold(symbol, entry_min)
     else:
         with diag_lock: diag_counts["smi_oversold"] += 1
+        return  # ← أضفنا return هنا: ما في داعي نكمل لو SMI فاشل
 
-    # لو الحالة النشطة للعملة ليست هذا الفريم → توقف
-    # (إما لم يصير تشبع بعد، أو فريم أصغر أخذ الأولوية)
+    # ③ فلتر التسلسل: هل هذا الفريم هو النشط؟ ← المُصلح
     active = get_active_entry(symbol)
     if active != entry_min:
+        with diag_lock: diag_counts["active_skip"] += 1  # ← يُحسب الآن!
         return
 
-    # ② MACD أحمر على فريم الدخول
+    # ④ MACD أحمر على فريم الدخول
     if not check_macd_red(df_entry):
         with diag_lock: diag_counts["macd_red"] += 1
         return
 
-    # ③ Donchian Trend Ribbon أخضر على فريم الدخول
+    # ⑤ Donchian Trend Ribbon أخضر على فريم الدخول
     if not check_donchian_ribbon(df_entry, direction="green"):
         with diag_lock: diag_counts["donchian_entry"] += 1
         return
 
-    # ④ Donchian Trend Ribbon أخضر على فريم التأكيد (×3)
+    # ⑥ Donchian Trend Ribbon أخضر على فريم التأكيد (×3)
     if not check_donchian_ribbon(df_confirm, direction="green"):
         with diag_lock: diag_counts["donchian_confirm"] += 1
         return
 
-    # ⑤ MACD أخضر على فريم التأكيد (×3)
+    # ⑦ MACD أخضر على فريم التأكيد (×3)
     if not check_macd_green(df_confirm):
         with diag_lock: diag_counts["macd_confirm"] += 1
         return
 
-    # ⑥ EMA50 — السعر تحت الخط
+    # ⑧ EMA50 — السعر تحت الخط
     if not check_ema50_below(df_entry):
         with diag_lock: diag_counts["ema50"] += 1
         return
 
-    # ⑦ RSI تقاطع + Stochastic على فريم الدخول (÷3)
+    # ⑨ RSI تقاطع + Stochastic على فريم الدخول (÷3)
     if not check_rsi_stoch(df_third):
         with diag_lock: diag_counts["rsi_stoch"] += 1
         price = df_entry["close"].iloc[-1]
@@ -635,7 +622,6 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
         if key in alerted_keys: return
         alerted_keys[key] = datetime.now(timezone.utc)
 
-    # امسح الحالة بعد الإشارة حتى ينتظر تشبع بيعي جديد
     clear_active_entry(symbol)
 
     price       = df_entry["close"].iloc[-1]
@@ -715,9 +701,9 @@ def poll_telegram_commands():
                     with near_signals_lock:
                         rows = list(near_signals)[-30:]
                     if not rows:
-                        send_telegram("⏳ لا توجد عملات وصلت للشرط السادس بعد.", chat_id)
+                        send_telegram("⏳ لا توجد عملات وصلت للشرط الأخير بعد.", chat_id)
                     else:
-                        lines = [f"<b>🎯 عملات اجتازت 6 شروط — RSI/Stoch فقط باقي ({len(rows)}):</b>\n" + "━" * 15]
+                        lines = [f"<b>🎯 عملات اجتازت 8 شروط — RSI/Stoch فقط باقي ({len(rows)}):</b>\n" + "━" * 15]
                         for row in reversed(rows):
                             lines.append(
                                 f"🔸 {row['symbol']} | {row['tf']} | "
@@ -744,7 +730,7 @@ def poll_telegram_commands():
                         f"🤖 البوت يعمل — KuCoin API\n"
                         f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
                         f"📊 إجمالي الإشارات: {cnt}\n"
-                        f"🎯 قريبة من الإشارة (6/7): {near}\n"
+                        f"🎯 قريبة من الإشارة (8/9): {near}\n"
                         f"🔄 عملات في حالة انتظار: {states}\n"
                         f"🔑 تنبيهات نشطة: {active}\n"
                         f"💾 الكاش: {keys} مفتاح\n"
@@ -779,7 +765,6 @@ def poll_telegram_commands():
                         send_telegram("⚠️ لا توجد عملات.", chat_id)
                     else:
                         fast_prefetch_done.clear(); prefetch_done.clear()
-                        # امسح حالات التشبع عند إعادة التحميل
                         with smi_state_lock: smi_state.clear()
                         threading.Thread(target=prefetch_all, args=(syms,), daemon=True).start()
                         send_telegram(f"🚀 بدأ إعادة التحميل لـ {len(syms)} عملة...", chat_id)
@@ -789,7 +774,7 @@ def poll_telegram_commands():
                         "1️⃣  <code>1</code> — إشارات اليوم\n"
                         "2️⃣  <code>2</code> — إشارات أمس\n"
                         "3️⃣  <code>3</code> — آخر 7 أيام\n"
-                        "🎯  <code>/top6</code> — عملات اجتازت 6 شروط\n"
+                        "🎯  <code>/top6</code> — عملات اجتازت 8 شروط\n"
                         "📊  <code>/state</code> — عملات في حالة انتظار\n"
                         "📊  <code>/status</code> — حالة البوت\n"
                         "🔬  <code>/cache</code> — فحص الكاش\n"
