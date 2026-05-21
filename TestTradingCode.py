@@ -34,9 +34,15 @@ TRIPLING_PAIRS = [
     ( 30,  90, 10, "1m", "1m"),
     ( 45, 135, 15, "1m", "1m"),
     ( 60, 180, 20, "60m","1m"),
+    ( 90, 270, 30, "60m","1m"),
     (120, 360, 40, "60m","1m"),
     (180, 540, 60, "60m","60m"),
 ]
+
+# تسلسل الفريمات من الأصغر للأكبر — كل فريم يلغي الذي يليه فقط
+TIMEFRAME_CHAIN = [9, 12, 15, 18, 21, 24, 27, 30, 45, 60, 90, 120, 180]
+NEXT_TF = {TIMEFRAME_CHAIN[i]: TIMEFRAME_CHAIN[i+1] for i in range(len(TIMEFRAME_CHAIN)-1)}
+# مثال: NEXT_TF[9] = 12, NEXT_TF[12] = 15, ...
 
 FAST_FETCH_CANDLES = {"1m": 3500, "60m": 250}
 API_FETCH_CANDLES  = {"1m": 15_000, "60m": 2_000}
@@ -53,6 +59,11 @@ symbols_cache      = []
 symbols_cache_lock = threading.Lock()
 ohlcv_cache        = {}
 ohlcv_cache_lock   = threading.Lock()
+
+# ── حالة التشبع البيعي لكل عملة ──────────────────────────────────────────────
+# smi_state[symbol] = entry_min اللي يجب مراقبته حالياً (None = لا يوجد)
+smi_state      = {}
+smi_state_lock = threading.Lock()
 
 fast_prefetch_done = threading.Event()
 prefetch_done      = threading.Event()
@@ -350,7 +361,6 @@ def resample_ohlcv(df, minutes):
 # المؤشرات
 # ──────────────────────────────────────────────
 
-# MACD أخضر على فريم التأكيد (×3)
 def check_macd_green(df):
     if len(df) < 35: return False
     c   = df["close"]
@@ -358,7 +368,6 @@ def check_macd_green(df):
     sig = ml.ewm(span=9, adjust=False).mean()
     return bool((ml - sig).iloc[-1] > 0)
 
-# MACD أحمر على الفريم الرئيسي
 def check_macd_red(df):
     if len(df) < 35: return False
     c   = df["close"]
@@ -366,7 +375,6 @@ def check_macd_red(df):
     sig = ml.ewm(span=9, adjust=False).mean()
     return bool((ml - sig).iloc[-1] < 0)
 
-# Donchian Trend Ribbon
 def _dchannel_trend(closes, hh_prev, ll_prev):
     n = len(closes)
     trend = np.zeros(n, dtype=np.int8)
@@ -384,31 +392,25 @@ def _dchannel_trend(closes, hh_prev, ll_prev):
 def check_donchian_ribbon(df, length=20, direction="green"):
     min_len = length + 2
     if len(df) < min_len: return False
-
     closes = df["close"].values
     highs  = df["high"].values
     lows   = df["low"].values
-
     def get_trend(ln):
         hh = pd.Series(highs).rolling(ln).max().shift(1).values
         ll = pd.Series(lows).rolling(ln).min().shift(1).values
         return int(_dchannel_trend(closes, hh, ll)[-1])
-
     main_trend = get_trend(length)
     sub_trends = [get_trend(l) for l in range(length - 1, max(length - 10, 4), -1)]
-
     if direction == "green":
         return main_trend == 1 and sum(t == 1 for t in sub_trends) >= 5
     else:
         return main_trend == -1 and sum(t == -1 for t in sub_trends) >= 5
 
-# EMA50
 def check_ema50_below(df):
     if len(df) < 50: return False
     ema = df["close"].ewm(span=50, adjust=False).mean()
     return bool(df["close"].iloc[-1] < ema.iloc[-1])
 
-# SMI
 def calc_smi(high, low, close, k=10, d=3, ema=10, smooth=1):
     hh  = high.rolling(k).max()
     ll  = low.rolling(k).min()
@@ -425,7 +427,6 @@ def check_smi_oversold(df, threshold=-40, lookback=5):
     smi, _ = calc_smi(df["high"], df["low"], df["close"])
     return bool(smi.iloc[-lookback:].min() <= threshold)
 
-# RSI + Stochastic
 def wilder_rma(series, period):
     return series.ewm(alpha=1/period, adjust=False).mean()
 
@@ -451,6 +452,34 @@ def check_rsi_stoch(df, lookback=5):
     k_raw = 100 * (close - lo15) / (hi15 - lo15 + 1e-10)
     k     = k_raw.rolling(3).mean()
     return any(k.iloc[i-1] < 20 and k.iloc[i] >= 20 for i in range(-lookback, 0))
+
+# ──────────────────────────────────────────────
+# منطق تتابع الفريمات (الجديد)
+# ──────────────────────────────────────────────
+def on_smi_oversold(symbol, entry_min):
+    """
+    لما يصير تشبع بيعي في entry_min:
+    - يلغي الفريم الأكبر التالي فقط (NEXT_TF[entry_min])
+    - يحفظ entry_min كالفريم النشط للعملة
+    """
+    next_tf = NEXT_TF.get(entry_min)  # الفريم الأكبر الذي يُلغى
+    with smi_state_lock:
+        current = smi_state.get(symbol)
+        # لو كان ينتظر فريم أكبر، ألغِه وانزل للأصغر
+        if current is None or current >= entry_min:
+            smi_state[symbol] = entry_min
+            if next_tf:
+                log.info(f"🔄 {symbol}: تشبع بيعي {entry_min}m → ألغى {next_tf}m وبدأ مراقبة {entry_min}m")
+
+def get_active_entry(symbol):
+    """يرجع الـ entry_min النشط للعملة، أو None"""
+    with smi_state_lock:
+        return smi_state.get(symbol)
+
+def clear_active_entry(symbol):
+    """بعد الإشارة أو انتهاء الصلاحية، امسح الحالة"""
+    with smi_state_lock:
+        smi_state.pop(symbol, None)
 
 # ──────────────────────────────────────────────
 # Diagnostics
@@ -483,12 +512,10 @@ def build_diag_msg(reset=False):
         non_total = {k: v for k, v in diag_counts.items() if k not in ["total", "passed"]}
         worst_k = max(non_total, key=lambda k: non_total[k])
         worst_v = non_total[worst_k]
-
         lines = [
             "🔍 <b>تقرير التشخيص</b>", "━━━━━━━━━━━━━━━",
             f"📊 إجمالي الفحوصات: <b>{t}</b>", "",
         ]
-
         remaining = t
         for k, fail_label in DIAG_LABELS.items():
             failed  = diag_counts[k]
@@ -501,7 +528,6 @@ def build_diag_msg(reset=False):
                 f"    {bar} نجح: {passed} ({pass_pct}%) | فشل: {failed} ({fail_pct}%)"
             )
             remaining = passed
-
         lines += [
             "", f"🏆 اجتازت الكل: <b>{diag_counts['passed']}</b>",
             "━━━━━━━━━━━━━━━",
@@ -517,9 +543,16 @@ def send_diag_report():
         send_telegram(build_diag_msg(reset=True))
 
 # ──────────────────────────────────────────────
-# ✅ scan_symbol — الترتيب الجديد
+# ✅ scan_symbol — مع منطق تتابع الفريمات
 # ──────────────────────────────────────────────
 def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
+    """
+    المنطق الجديد:
+    1. دائماً نفحص SMI على فريم entry_min
+    2. لو تشبع بيعي → نسجل الحالة ونلغي الفريم الأكبر التالي
+    3. لو العملة عندها حالة نشطة تساوي entry_min → نكمل باقي الشروط
+    4. لو الحالة النشطة أصغر من entry_min → هذا الواتشر متجاوَز، نتجاهل
+    """
     raw_ec = get_cached(symbol, ec_api)
     raw_t  = get_cached(symbol, t_api)
 
@@ -541,9 +574,17 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
         with diag_lock: diag_counts["no_data"] += 1
         return
 
-    # ① SMI تشبع بيعي على فريم الدخول
-    if not check_smi_oversold(df_entry):
+    # ① SMI تشبع بيعي — دائماً نفحصه ونحدّث الحالة
+    smi_ok = check_smi_oversold(df_entry)
+    if smi_ok:
+        on_smi_oversold(symbol, entry_min)
+    else:
         with diag_lock: diag_counts["smi_oversold"] += 1
+
+    # لو الحالة النشطة للعملة ليست هذا الفريم → توقف
+    # (إما لم يصير تشبع بعد، أو فريم أصغر أخذ الأولوية)
+    active = get_active_entry(symbol)
+    if active != entry_min:
         return
 
     # ② MACD أحمر على فريم الدخول
@@ -574,7 +615,6 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
     # ⑦ RSI تقاطع + Stochastic على فريم الدخول (÷3)
     if not check_rsi_stoch(df_third):
         with diag_lock: diag_counts["rsi_stoch"] += 1
-        # 🔔 وصلت للشرط السادس — احفظها للمتابعة
         price = df_entry["close"].iloc[-1]
         with near_signals_lock:
             near_signals.append({
@@ -594,6 +634,9 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
     with alerted_keys_lock:
         if key in alerted_keys: return
         alerted_keys[key] = datetime.now(timezone.utc)
+
+    # امسح الحالة بعد الإشارة حتى ينتظر تشبع بيعي جديد
+    clear_active_entry(symbol)
 
     price       = df_entry["close"].iloc[-1]
     now_utc     = datetime.now(timezone.utc)
@@ -681,16 +724,28 @@ def poll_telegram_commands():
                                 f"{row['price']:.6g} | {row['time'].strftime('%H:%M UTC')}"
                             )
                         send_telegram("\n".join(lines), chat_id)
+                elif txt == "/state":
+                    with smi_state_lock:
+                        active_states = dict(smi_state)
+                    if not active_states:
+                        send_telegram("📭 لا توجد عملات في حالة انتظار حالياً.", chat_id)
+                    else:
+                        lines = [f"<b>📊 حالات التشبع البيعي النشطة ({len(active_states)}):</b>\n" + "━" * 15]
+                        for sym, tf_min in sorted(active_states.items(), key=lambda x: x[1]):
+                            lines.append(f"🔸 {sym} → ينتظر دخول على <b>{tf_min}m</b>")
+                        send_telegram("\n".join(lines), chat_id)
                 elif txt == "/status":
                     with trades_lock:       cnt    = len(trades_history)
                     with alerted_keys_lock: active = len(alerted_keys)
                     with ohlcv_cache_lock:  keys   = len(ohlcv_cache)
                     with near_signals_lock: near   = len(near_signals)
+                    with smi_state_lock:    states = len(smi_state)
                     send_telegram(
                         f"🤖 البوت يعمل — KuCoin API\n"
                         f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
                         f"📊 إجمالي الإشارات: {cnt}\n"
                         f"🎯 قريبة من الإشارة (6/7): {near}\n"
+                        f"🔄 عملات في حالة انتظار: {states}\n"
                         f"🔑 تنبيهات نشطة: {active}\n"
                         f"💾 الكاش: {keys} مفتاح\n"
                         f"⚡ تحميل سريع: {'✅' if fast_prefetch_done.is_set() else '⏳'}\n"
@@ -724,6 +779,8 @@ def poll_telegram_commands():
                         send_telegram("⚠️ لا توجد عملات.", chat_id)
                     else:
                         fast_prefetch_done.clear(); prefetch_done.clear()
+                        # امسح حالات التشبع عند إعادة التحميل
+                        with smi_state_lock: smi_state.clear()
                         threading.Thread(target=prefetch_all, args=(syms,), daemon=True).start()
                         send_telegram(f"🚀 بدأ إعادة التحميل لـ {len(syms)} عملة...", chat_id)
                 elif txt == "/help":
@@ -733,6 +790,7 @@ def poll_telegram_commands():
                         "2️⃣  <code>2</code> — إشارات أمس\n"
                         "3️⃣  <code>3</code> — آخر 7 أيام\n"
                         "🎯  <code>/top6</code> — عملات اجتازت 6 شروط\n"
+                        "📊  <code>/state</code> — عملات في حالة انتظار\n"
                         "📊  <code>/status</code> — حالة البوت\n"
                         "🔬  <code>/cache</code> — فحص الكاش\n"
                         "🧪  <code>/fetchtest</code> — اختبار KuCoin\n"
