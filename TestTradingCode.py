@@ -453,18 +453,6 @@ def check_rsi_stoch(df, lookback=5):
 # ──────────────────────────────────────────────
 # منطق تتابع الفريمات
 # ──────────────────────────────────────────────
-
-# ✅ إصلاح 1: الفريم الأكبر يلغي الأصغر
-# القاعدة: smi_state دائماً يحتفظ بأكبر فريم شاف تشبع بيعي
-# مثال: 12m نشط → جاء 21m → 21 >= 12 → smi_state = 21 → 12m يسكت
-def on_smi_oversold(symbol, entry_min):
-    with smi_state_lock:
-        current = smi_state.get(symbol)
-        if current is None or entry_min >= current:   # ← الإصلاح: >= بدل current >=
-            smi_state[symbol] = entry_min
-            log.info(f"🔄 {symbol}: تشبع بيعي {entry_min}m → smi_state={entry_min}"
-                     + (f" (ألغى {current}m)" if current and current != entry_min else ""))
-
 def get_active_entry(symbol):
     with smi_state_lock:
         return smi_state.get(symbol)
@@ -537,7 +525,7 @@ def send_diag_report():
         send_telegram(build_diag_msg(reset=True))
 
 # ──────────────────────────────────────────────
-# scan_symbol
+# scan_symbol — ✅ الإصلاح الرئيسي هنا
 # ──────────────────────────────────────────────
 def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
     raw_ec = get_cached(symbol, ec_api)
@@ -562,16 +550,26 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
         with diag_lock: diag_counts["no_data"] += 1
         return
 
-    # ② SMI تشبع بيعي
+    # ✅ الإصلاح: دمج ② SMI + ③ فلتر التسلسل في عملية أتوميكية واحدة
+    # يمنع Race Condition بين الثريدات
     smi_ok = check_smi_oversold(df_entry)
-    if smi_ok:
-        on_smi_oversold(symbol, entry_min)
-    else:
+
+    with smi_state_lock:
+        if smi_ok:
+            current = smi_state.get(symbol)
+            if current is None or entry_min >= current:
+                smi_state[symbol] = entry_min
+                log.info(
+                    f"🔄 {symbol}: تشبع بيعي {entry_min}m → smi_state={entry_min}"
+                    + (f" (ألغى {current}m)" if current and current != entry_min else "")
+                )
+        # قراءة الحالة النشطة داخل نفس اللوك لضمان التزامن
+        active = smi_state.get(symbol)
+
+    if not smi_ok:
         with diag_lock: diag_counts["smi_oversold"] += 1
         return
 
-    # ③ فلتر التسلسل: هل هذا الفريم هو النشط؟
-    active = get_active_entry(symbol)
     if active != entry_min:
         with diag_lock: diag_counts["active_skip"] += 1
         return
@@ -606,7 +604,6 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
         with diag_lock: diag_counts["rsi_stoch"] += 1
         price = df_entry["close"].iloc[-1]
 
-        # ✅ إصلاح 2: فلتر تكرار near_signals — نفس العملة+الفريم مرة واحدة فقط
         near_key = f"{symbol}_{entry_min}"
         with near_signals_lock:
             existing_keys = {
