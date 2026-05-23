@@ -452,28 +452,18 @@ def check_rsi_stoch(df, lookback=5):
 
 # ──────────────────────────────────────────────
 # منطق تتابع الفريمات
-# ✅ يمسح near_signals فقط لو جاء فريم أصغر (أولوية أعلى) يلغي السابق
 # ──────────────────────────────────────────────
-def on_smi_oversold(symbol, entry_min):
-    next_tf = NEXT_TF.get(entry_min)
-    should_clear_near = False
 
+# ✅ إصلاح 1: الفريم الأكبر يلغي الأصغر
+# القاعدة: smi_state دائماً يحتفظ بأكبر فريم شاف تشبع بيعي
+# مثال: 12m نشط → جاء 21m → 21 >= 12 → smi_state = 21 → 12m يسكت
+def on_smi_oversold(symbol, entry_min):
     with smi_state_lock:
         current = smi_state.get(symbol)
-        if current is None or current >= entry_min:
+        if current is None or entry_min >= current:   # ← الإصلاح: >= بدل current >=
             smi_state[symbol] = entry_min
-            if next_tf:
-                log.info(f"🔄 {symbol}: تشبع بيعي {entry_min}m → ألغى {next_tf}m وبدأ مراقبة {entry_min}m")
-            # ✅ امسح near_signals فقط لو الفريم الجديد أصغر من السابق (إعادة ضبط)
-            if current is not None and entry_min < current:
-                should_clear_near = True
-
-    if should_clear_near:
-        with near_signals_lock:
-            to_remove = [s for s in near_signals if s["symbol"] == symbol]
-            for s in to_remove:
-                near_signals.remove(s)
-        log.info(f"🧹 {symbol}: مُسحت near_signals القديمة بسبب فريم أصغر {entry_min}m < {current}m")
+            log.info(f"🔄 {symbol}: تشبع بيعي {entry_min}m → smi_state={entry_min}"
+                     + (f" (ألغى {current}m)" if current and current != entry_min else ""))
 
 def get_active_entry(symbol):
     with smi_state_lock:
@@ -615,13 +605,21 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
     if not check_rsi_stoch(df_third):
         with diag_lock: diag_counts["rsi_stoch"] += 1
         price = df_entry["close"].iloc[-1]
+
+        # ✅ إصلاح 2: فلتر تكرار near_signals — نفس العملة+الفريم مرة واحدة فقط
+        near_key = f"{symbol}_{entry_min}"
         with near_signals_lock:
-            near_signals.append({
-                "time"  : datetime.now(timezone.utc),
-                "symbol": symbol,
-                "price" : price,
-                "tf"    : f"{entry_min}m/{confirm_min}m/{third_min}m",
-            })
+            existing_keys = {
+                f"{r['symbol']}_{r['tf'].split('/')[0].replace('m', '')}"
+                for r in near_signals
+            }
+            if near_key not in existing_keys:
+                near_signals.append({
+                    "time"  : datetime.now(timezone.utc),
+                    "symbol": symbol,
+                    "price" : price,
+                    "tf"    : f"{entry_min}m/{confirm_min}m/{third_min}m",
+                })
         return
 
     # ✅ كل الشروط اتحققت
