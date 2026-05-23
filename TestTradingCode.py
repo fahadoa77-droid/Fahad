@@ -64,12 +64,11 @@ smi_state_lock = threading.Lock()
 fast_prefetch_done = threading.Event()
 prefetch_done      = threading.Event()
 
-# ✅ إضافة "active_skip" لعداد التشخيص
 diag_counts = {
     "total"          : 0,
     "no_data"        : 0,
     "smi_oversold"   : 0,
-    "active_skip"    : 0,   # ← جديد: عدد العملات التي تجاوزها فلتر active
+    "active_skip"    : 0,
     "macd_red"       : 0,
     "donchian_entry" : 0,
     "donchian_confirm": 0,
@@ -342,7 +341,7 @@ def cache_updater_60m():
             if syms: _update_batch(syms, "60m", limit=5)
 
 # ──────────────────────────────────────────────
-# Resample
+# ✅ Resample — يحذف الشمعة الحية بالوقت الفعلي
 # ──────────────────────────────────────────────
 def resample_ohlcv(df, minutes):
     if df.empty or minutes <= 0: return pd.DataFrame()
@@ -350,8 +349,16 @@ def resample_ohlcv(df, minutes):
         r = (df.copy().set_index("ts")
              .resample(f"{minutes}min", closed="left", label="left", origin=EPOCH)
              .agg({"open":"first","high":"max","low":"min","close":"last","vol":"sum"})
-             .dropna())
-        return r.iloc[:-1].reset_index()
+             .dropna()
+             .reset_index())
+
+        now_utc  = datetime.now(timezone.utc)
+        epoch_dt = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        elapsed  = int((now_utc - epoch_dt).total_seconds() / 60)
+        current_candle_start = pd.Timestamp(
+            epoch_dt + timedelta(minutes=(elapsed // minutes) * minutes)
+        )
+        return r[r["ts"] < current_candle_start].reset_index(drop=True)
     except Exception as e:
         log.error(f"resample error: {e}")
         return pd.DataFrame()
@@ -373,57 +380,101 @@ def check_macd_red(df):
     sig = ml.ewm(span=9, adjust=False).mean()
     return bool((ml - sig).iloc[-1] < 0)
 
-def _dchannel_trend(closes, hh_prev, ll_prev):
-    n = len(closes)
-    trend = np.zeros(n, dtype=np.int8)
+# ──────────────────────────────────────────────
+# ✅ Donchian Trend Ribbon — مطابق Pine Script 100%
+#
+#  dchannel(len):
+#      hh = highest(high, len)   → rolling(len).max()
+#      ll = lowest(low, len)     → rolling(len).min()
+#      trend = close > hh[1] ? 1 : close < ll[1] ? -1 : trend[1]
+#              ↑ hh[1] = shift(1) أي أعلى الـ len شمعة السابقة
+#
+#  10 أشرطة: dlen-0 .. dlen-9  (20,19,18,...,11)
+#  اللون أخضر صلب = maintrend==1 AND sub_trend==1 للكل
+# ──────────────────────────────────────────────
+def _dchannel_trend(closes, highs, lows, ln):
+    n         = len(closes)
+    trend     = np.zeros(n, dtype=np.int8)
+    hh_series = pd.Series(highs).rolling(ln).max().shift(1).values
+    ll_series = pd.Series(lows).rolling(ln).min().shift(1).values
     for i in range(1, n):
-        if np.isnan(hh_prev[i]) or np.isnan(ll_prev[i]):
+        if np.isnan(hh_series[i]) or np.isnan(ll_series[i]):
             trend[i] = 0
-        elif closes[i] > hh_prev[i]:
+        elif closes[i] > hh_series[i]:
             trend[i] = 1
-        elif closes[i] < ll_prev[i]:
+        elif closes[i] < ll_series[i]:
             trend[i] = -1
         else:
             trend[i] = trend[i - 1]
     return trend
 
 def check_donchian_ribbon(df, length=20, direction="green"):
-    min_len = length + 2
-    if len(df) < min_len: return False
+    if len(df) < length + 5: return False
     closes = df["close"].values
     highs  = df["high"].values
     lows   = df["low"].values
-    def get_trend(ln):
-        hh = pd.Series(highs).rolling(ln).max().shift(1).values
-        ll = pd.Series(lows).rolling(ln).min().shift(1).values
-        return int(_dchannel_trend(closes, hh, ll)[-1])
-    main_trend = get_trend(length)
-    sub_trends = [get_trend(l) for l in range(length - 1, max(length - 10, 4), -1)]
+
+    # الشريط الرئيسي dlen-0
+    main_trend = int(_dchannel_trend(closes, highs, lows, length)[-1])
+
+    # 9 أشرطة فرعية: dlen-1 .. dlen-9
+    sub_trends = []
+    for i in range(1, 10):
+        ln = length - i
+        if ln >= 1:
+            sub_trends.append(int(_dchannel_trend(closes, highs, lows, ln)[-1]))
+
     if direction == "green":
-        return main_trend == 1 and sum(t == 1 for t in sub_trends) >= 5
+        return main_trend == 1 and all(t == 1 for t in sub_trends)
     else:
-        return main_trend == -1 and sum(t == -1 for t in sub_trends) >= 5
+        return main_trend == -1 and all(t == -1 for t in sub_trends)
 
-def check_ema50_below(df):
-    if len(df) < 50: return False
-    ema = df["close"].ewm(span=50, adjust=False).mean()
-    return bool(df["close"].iloc[-1] < ema.iloc[-1])
+# ──────────────────────────────────────────────
+# ✅ SMI — مطابق Stoch_MTM في TradingView 100%
+#
+#  Pine Script:
+#      ll      = lowest(low, a)          → rolling(k).min()
+#      hh      = highest(high, a)        → rolling(k).max()
+#      diff    = hh - ll
+#      rdiff   = close - (hh+ll)/2
+#      avgrel  = ema(rdiff, b)           → EMA واحدة فقط ✅
+#      avgdiff = ema(diff,  b)           → EMA واحدة فقط ✅
+#      SMI     = avgrel / (avgdiff/2) * 100
+#      SMI_smoothed = sma(SMI, smooth)   → smooth=1 → لا تأثير
+#      signal  = ema(SMI_smoothed, c)
+# ──────────────────────────────────────────────
+def calc_smi(high, low, close, k=10, d=3, ema_len=10, smooth=1):
+    hh      = high.rolling(k).max()
+    ll      = low.rolling(k).min()
+    diff    = hh - ll
+    rdiff   = close - (hh + ll) / 2
 
-def calc_smi(high, low, close, k=10, d=3, ema=10, smooth=1):
-    hh  = high.rolling(k).max()
-    ll  = low.rolling(k).min()
-    mid = (hh + ll) / 2
-    ds  = (close - mid).ewm(span=d, adjust=False).mean().ewm(span=d, adjust=False).mean()
-    hls = ((hh - ll) / 2).ewm(span=d, adjust=False).mean().ewm(span=d, adjust=False).mean()
-    smi = 200 * ds / (hls.abs() + 1e-10)
-    if smooth > 1: smi = smi.rolling(smooth).mean()
-    sig = smi.ewm(span=ema, adjust=False).mean()
+    # EMA واحدة فقط — مطابق Pine Script
+    avgrel  = rdiff.ewm(span=d, adjust=False).mean()
+    avgdiff = diff.ewm(span=d, adjust=False).mean()
+
+    # SMI = avgrel / (avgdiff/2) * 100 — مع حماية القسمة على صفر
+    smi = (avgrel / (avgdiff / 2) * 100).where(avgdiff.abs() > 1e-10, 0.0)
+
+    # Smoothing (smooth=1 → لا تأثير فعلي)
+    if smooth > 1:
+        smi = smi.rolling(smooth).mean()
+
+    sig = smi.ewm(span=ema_len, adjust=False).mean()
     return smi, sig
 
 def check_smi_oversold(df, threshold=-40, lookback=5):
     if len(df) < 30: return False
     smi, _ = calc_smi(df["high"], df["low"], df["close"])
     return bool(smi.iloc[-lookback:].min() <= threshold)
+
+# ──────────────────────────────────────────────
+# بقية المؤشرات
+# ──────────────────────────────────────────────
+def check_ema50_below(df):
+    if len(df) < 50: return False
+    ema = df["close"].ewm(span=50, adjust=False).mean()
+    return bool(df["close"].iloc[-1] < ema.iloc[-1])
 
 def wilder_rma(series, period):
     return series.ewm(alpha=1/period, adjust=False).mean()
@@ -461,7 +512,7 @@ def on_smi_oversold(symbol, entry_min):
         if current is None or current >= entry_min:
             smi_state[symbol] = entry_min
             if next_tf:
-                log.info(f"🔄 {symbol}: تشبع بيعي {entry_min}m → ألغى {next_tf}m وبدأ مراقبة {entry_min}m")
+                log.info(f"🔄 {symbol}: تشبع بيعي {entry_min}m → بدأ مراقبة {entry_min}m")
 
 def get_active_entry(symbol):
     with smi_state_lock:
@@ -477,7 +528,7 @@ def clear_active_entry(symbol):
 DIAG_LABELS = {
     "no_data"         : "بيانات ناقصة",
     "smi_oversold"    : "SMI مش في التشبع البيعي",
-    "active_skip"     : "الفريم غير نشط (تجاوزه فلتر التسلسل)",   # ← جديد
+    "active_skip"     : "الفريم غير نشط",
     "macd_red"        : "MACD الرئيسي مش أحمر",
     "donchian_entry"  : "Donchian Ribbon الرئيسي مش أخضر",
     "donchian_confirm": "Donchian Ribbon Confirm مش أخضر",
@@ -489,11 +540,11 @@ DIAG_LABELS = {
 DIAG_PASS_LABELS = {
     "no_data"         : "بيانات كافية ✅",
     "smi_oversold"    : "SMI في التشبع البيعي ✅",
-    "active_skip"     : "الفريم نشط ومفعّل ✅",                    # ← جديد
+    "active_skip"     : "الفريم نشط ✅",
     "macd_red"        : "MACD الرئيسي أحمر ✅",
-    "donchian_entry"  : "Donchian Ribbon الرئيسي أخضر ✅",
+    "donchian_entry"  : "Donchian Ribbon أخضر ✅",
     "donchian_confirm": "Donchian Ribbon Confirm أخضر ✅",
-    "macd_confirm"    : "MACD Confirm أخضر (×3) ✅",
+    "macd_confirm"    : "MACD Confirm أخضر ✅",
     "ema50"           : "السعر تحت EMA50 ✅",
     "rsi_stoch"       : "RSI/Stochastic اتحقق ✅",
 }
@@ -535,7 +586,7 @@ def send_diag_report():
         send_telegram(build_diag_msg(reset=True))
 
 # ──────────────────────────────────────────────
-# ✅ scan_symbol — مع عداد active_skip المُصلح
+# scan_symbol
 # ──────────────────────────────────────────────
 def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
     raw_ec = get_cached(symbol, ec_api)
@@ -566,12 +617,12 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
         on_smi_oversold(symbol, entry_min)
     else:
         with diag_lock: diag_counts["smi_oversold"] += 1
-        return  # ← أضفنا return هنا: ما في داعي نكمل لو SMI فاشل
+        return
 
-    # ③ فلتر التسلسل: هل هذا الفريم هو النشط؟ ← المُصلح
+    # ③ فلتر التسلسل
     active = get_active_entry(symbol)
     if active != entry_min:
-        with diag_lock: diag_counts["active_skip"] += 1  # ← يُحسب الآن!
+        with diag_lock: diag_counts["active_skip"] += 1
         return
 
     # ④ MACD أحمر على فريم الدخول
@@ -579,17 +630,17 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
         with diag_lock: diag_counts["macd_red"] += 1
         return
 
-    # ⑤ Donchian Trend Ribbon أخضر على فريم الدخول
+    # ⑤ Donchian Ribbon أخضر على فريم الدخول
     if not check_donchian_ribbon(df_entry, direction="green"):
         with diag_lock: diag_counts["donchian_entry"] += 1
         return
 
-    # ⑥ Donchian Trend Ribbon أخضر على فريم التأكيد (×3)
+    # ⑥ Donchian Ribbon أخضر على فريم التأكيد
     if not check_donchian_ribbon(df_confirm, direction="green"):
         with diag_lock: diag_counts["donchian_confirm"] += 1
         return
 
-    # ⑦ MACD أخضر على فريم التأكيد (×3)
+    # ⑦ MACD أخضر على فريم التأكيد
     if not check_macd_green(df_confirm):
         with diag_lock: diag_counts["macd_confirm"] += 1
         return
@@ -599,7 +650,7 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
         with diag_lock: diag_counts["ema50"] += 1
         return
 
-    # ⑨ RSI تقاطع + Stochastic على فريم الدخول (÷3)
+    # ⑨ RSI تقاطع + Stochastic
     if not check_rsi_stoch(df_third):
         with diag_lock: diag_counts["rsi_stoch"] += 1
         price = df_entry["close"].iloc[-1]
@@ -703,7 +754,7 @@ def poll_telegram_commands():
                     if not rows:
                         send_telegram("⏳ لا توجد عملات وصلت للشرط الأخير بعد.", chat_id)
                     else:
-                        lines = [f"<b>🎯 عملات اجتازت 8 شروط — RSI/Stoch فقط باقي ({len(rows)}):</b>\n" + "━" * 15]
+                        lines = [f"<b>🎯 عملات اجتازت 8 شروط ({len(rows)}):</b>\n" + "━" * 15]
                         for row in reversed(rows):
                             lines.append(
                                 f"🔸 {row['symbol']} | {row['tf']} | "
