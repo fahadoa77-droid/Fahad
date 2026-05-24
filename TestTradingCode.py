@@ -433,22 +433,44 @@ def calc_rsi_tv(close, period=14):
     loss  = (-delta.clip(upper=0))
     return 100 - (100 / (1 + wilder_rma(gain, period) / (wilder_rma(loss, period) + 1e-10)))
 
-def check_rsi_stoch(df, lookback=5):
+def check_rsi_stoch(df, lookback=10):
     if len(df) < 50: return False
     close, high, low = df["close"], df["high"], df["low"]
-    rsi    = calc_rsi_tv(close, period=14)
-    rsi_ma = rsi.rolling(14).mean()
-    if rsi.iloc[-20:].min() > 35: return False
-    rsi_cross = any(
-        rsi.iloc[i-1] < rsi_ma.iloc[i-1] and rsi.iloc[i] >= rsi_ma.iloc[i]
-        for i in range(-10, 0)
-    )
-    if not rsi_cross: return False
+
+    # Stochastic — K=15, smooth_k=3, smooth_d=3
     lo15  = low.rolling(15).min()
     hi15  = high.rolling(15).max()
     k_raw = 100 * (close - lo15) / (hi15 - lo15 + 1e-10)
-    k     = k_raw.rolling(3).mean()
-    return any(k.iloc[i-1] < 20 and k.iloc[i] >= 20 for i in range(-lookback, 0))
+    k     = k_raw.rolling(3).mean()   # %K الأزرق (الأسرع)
+    d     = k.rolling(3).mean()       # %D البرتقالي (الأبطأ)
+
+    # RSI
+    rsi    = calc_rsi_tv(close, period=14)
+    rsi_ma = rsi.rolling(14).mean()
+    if rsi.iloc[-20:].min() > 35: return False
+
+    # ① آخر تقاطع RSI فوق متوسطه في آخر 10 شموع
+    rsi_cross_idx = None
+    for i in range(-lookback, 0):
+        if rsi.iloc[i-1] < rsi_ma.iloc[i-1] and rsi.iloc[i] >= rsi_ma.iloc[i]:
+            rsi_cross_idx = i
+            break
+
+    if rsi_cross_idx is None: return False
+
+    # ② و ③ من لحظة تقاطع RSI
+    cross_20 = False
+    cross_d  = False
+
+    for i in range(rsi_cross_idx, 0):
+        # %K الأزرق عبر فوق 20
+        if not cross_20 and k.iloc[i-1] <= 20 and k.iloc[i] > 20:
+            cross_20 = True
+        # %K الأزرق تقاطع إيجابي فوق %D البرتقالي
+        if not cross_d and k.iloc[i-1] <= d.iloc[i-1] and k.iloc[i] > d.iloc[i]:
+            cross_d = True
+
+    return cross_20 and cross_d
 
 # ──────────────────────────────────────────────
 # منطق تتابع الفريمات
@@ -467,7 +489,7 @@ def clear_active_entry(symbol):
 DIAG_LABELS = {
     "no_data"         : "بيانات ناقصة",
     "smi_oversold"    : "SMI مش في التشبع البيعي",
-    "active_skip"     : "الفريم غير نشط (تجاوزه فلتر التسلسل)",
+    "active_skip"     : "لم يحظَ بأولوية الفريم الأكبر",
     "macd_red"        : "MACD الرئيسي مش أحمر",
     "donchian_entry"  : "Donchian Ribbon الرئيسي مش أخضر",
     "donchian_confirm": "Donchian Ribbon Confirm مش أخضر",
@@ -476,16 +498,16 @@ DIAG_LABELS = {
     "rsi_stoch"       : "RSI/Stochastic ما اتحقق",
 }
 
-DIAG_PASS_LABELS = {
+STEP_LABELS = {
     "no_data"         : "بيانات كافية ✅",
-    "smi_oversold"    : "SMI في التشبع البيعي ✅",
-    "active_skip"     : "الفريم نشط ومفعّل ✅",
-    "macd_red"        : "MACD الرئيسي أحمر ✅",
-    "donchian_entry"  : "Donchian Ribbon الرئيسي أخضر ✅",
-    "donchian_confirm": "Donchian Ribbon Confirm أخضر ✅",
-    "macd_confirm"    : "MACD Confirm أخضر (×3) ✅",
-    "ema50"           : "السعر تحت EMA50 ✅",
-    "rsi_stoch"       : "RSI/Stochastic اتحقق ✅",
+    "smi_oversold"    : "① تشبع بيعي SMI ✅",
+    "active_skip"     : "② أولوية الفريم الأكبر ✅",
+    "macd_red"        : "③ MACD أحمر ✅",
+    "donchian_entry"  : "④ Donchian Ribbon أخضر ✅",
+    "donchian_confirm": "⑤ Donchian Confirm أخضر ✅",
+    "macd_confirm"    : "⑥ MACD Confirm أخضر (×3) ✅",
+    "ema50"           : "⑦ السعر تحت EMA50 ✅",
+    "rsi_stoch"       : "⑧ RSI تقاطع + Stochastic ✅",
 }
 
 def build_diag_msg(reset=False):
@@ -499,14 +521,14 @@ def build_diag_msg(reset=False):
             f"📊 إجمالي الفحوصات: <b>{t}</b>", "",
         ]
         remaining = t
-        for k, fail_label in DIAG_LABELS.items():
+        for k, pass_label in STEP_LABELS.items():
             failed   = diag_counts[k]
             passed   = remaining - failed
             pass_pct = int(passed / t * 100)
             fail_pct = int(failed / t * 100)
             bar = "█" * (pass_pct // 10) + "░" * (10 - pass_pct // 10)
             lines.append(
-                f"✅ {DIAG_PASS_LABELS[k]}\n"
+                f"{pass_label}\n"
                 f"    {bar} نجح: {passed} ({pass_pct}%) | فشل: {failed} ({fail_pct}%)"
             )
             remaining = passed
@@ -525,7 +547,7 @@ def send_diag_report():
         send_telegram(build_diag_msg(reset=True))
 
 # ──────────────────────────────────────────────
-# scan_symbol — ✅ الإصلاح الرئيسي هنا
+# scan_symbol
 # ──────────────────────────────────────────────
 def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
     raw_ec = get_cached(symbol, ec_api)
@@ -550,8 +572,7 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
         with diag_lock: diag_counts["no_data"] += 1
         return
 
-    # ✅ الإصلاح: دمج ② SMI + ③ فلتر التسلسل في عملية أتوميكية واحدة
-    # يمنع Race Condition بين الثريدات
+    # ① SMI + ② أولوية الفريم الأكبر
     smi_ok = check_smi_oversold(df_entry)
 
     with smi_state_lock:
@@ -563,7 +584,6 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
                     f"🔄 {symbol}: تشبع بيعي {entry_min}m → smi_state={entry_min}"
                     + (f" (ألغى {current}m)" if current and current != entry_min else "")
                 )
-        # قراءة الحالة النشطة داخل نفس اللوك لضمان التزامن
         active = smi_state.get(symbol)
 
     if not smi_ok:
@@ -574,32 +594,32 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
         with diag_lock: diag_counts["active_skip"] += 1
         return
 
-    # ④ MACD أحمر على فريم الدخول
+    # ③ MACD أحمر على فريم الدخول
     if not check_macd_red(df_entry):
         with diag_lock: diag_counts["macd_red"] += 1
         return
 
-    # ⑤ Donchian Trend Ribbon أخضر على فريم الدخول
+    # ④ Donchian Trend Ribbon أخضر على فريم الدخول
     if not check_donchian_ribbon(df_entry, direction="green"):
         with diag_lock: diag_counts["donchian_entry"] += 1
         return
 
-    # ⑥ Donchian Trend Ribbon أخضر على فريم التأكيد (×3)
+    # ⑤ Donchian Trend Ribbon أخضر على فريم التأكيد (×3)
     if not check_donchian_ribbon(df_confirm, direction="green"):
         with diag_lock: diag_counts["donchian_confirm"] += 1
         return
 
-    # ⑦ MACD أخضر على فريم التأكيد (×3)
+    # ⑥ MACD أخضر على فريم التأكيد (×3)
     if not check_macd_green(df_confirm):
         with diag_lock: diag_counts["macd_confirm"] += 1
         return
 
-    # ⑧ EMA50 — السعر تحت الخط
+    # ⑦ EMA50 — السعر تحت الخط
     if not check_ema50_below(df_entry):
         with diag_lock: diag_counts["ema50"] += 1
         return
 
-    # ⑨ RSI تقاطع + Stochastic على فريم الدخول (÷3)
+    # ⑧ RSI تقاطع + Stochastic على فريم الدخول (÷3)
     if not check_rsi_stoch(df_third):
         with diag_lock: diag_counts["rsi_stoch"] += 1
         price = df_entry["close"].iloc[-1]
