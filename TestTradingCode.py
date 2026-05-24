@@ -58,9 +58,6 @@ symbols_cache_lock = threading.Lock()
 ohlcv_cache        = {}
 ohlcv_cache_lock   = threading.Lock()
 
-smi_state      = {}
-smi_state_lock = threading.Lock()
-
 fast_prefetch_done = threading.Event()
 prefetch_done      = threading.Event()
 
@@ -437,19 +434,16 @@ def check_rsi_stoch(df, lookback=10):
     if len(df) < 50: return False
     close, high, low = df["close"], df["high"], df["low"]
 
-    # Stochastic — K=15, smooth_k=3, smooth_d=3
     lo15  = low.rolling(15).min()
     hi15  = high.rolling(15).max()
     k_raw = 100 * (close - lo15) / (hi15 - lo15 + 1e-10)
-    k     = k_raw.rolling(3).mean()   # %K الأزرق (الأسرع)
-    d     = k.rolling(3).mean()       # %D البرتقالي (الأبطأ)
+    k     = k_raw.rolling(3).mean()
+    d     = k.rolling(3).mean()
 
-    # RSI
     rsi    = calc_rsi_tv(close, period=14)
     rsi_ma = rsi.rolling(14).mean()
     if rsi.iloc[-20:].min() > 35: return False
 
-    # ① آخر تقاطع RSI فوق متوسطه في آخر 10 شموع
     rsi_cross_idx = None
     for i in range(-lookback, 0):
         if rsi.iloc[i-1] < rsi_ma.iloc[i-1] and rsi.iloc[i] >= rsi_ma.iloc[i]:
@@ -458,30 +452,16 @@ def check_rsi_stoch(df, lookback=10):
 
     if rsi_cross_idx is None: return False
 
-    # ② و ③ من لحظة تقاطع RSI
     cross_20 = False
     cross_d  = False
 
     for i in range(rsi_cross_idx, 0):
-        # %K الأزرق عبر فوق 20
         if not cross_20 and k.iloc[i-1] <= 20 and k.iloc[i] > 20:
             cross_20 = True
-        # %K الأزرق تقاطع إيجابي فوق %D البرتقالي
         if not cross_d and k.iloc[i-1] <= d.iloc[i-1] and k.iloc[i] > d.iloc[i]:
             cross_d = True
 
     return cross_20 and cross_d
-
-# ──────────────────────────────────────────────
-# منطق تتابع الفريمات
-# ──────────────────────────────────────────────
-def get_active_entry(symbol):
-    with smi_state_lock:
-        return smi_state.get(symbol)
-
-def clear_active_entry(symbol):
-    with smi_state_lock:
-        smi_state.pop(symbol, None)
 
 # ──────────────────────────────────────────────
 # Diagnostics
@@ -489,7 +469,7 @@ def clear_active_entry(symbol):
 DIAG_LABELS = {
     "no_data"         : "بيانات ناقصة",
     "smi_oversold"    : "SMI مش في التشبع البيعي",
-    "active_skip"     : "لم يحظَ بأولوية الفريم الأكبر",
+    "active_skip"     : "SMI الفريم الأكبر لم يتأكد",
     "macd_red"        : "MACD الرئيسي مش أحمر",
     "donchian_entry"  : "Donchian Ribbon الرئيسي مش أخضر",
     "donchian_confirm": "Donchian Ribbon Confirm مش أخضر",
@@ -501,7 +481,7 @@ DIAG_LABELS = {
 STEP_LABELS = {
     "no_data"         : "بيانات كافية ✅",
     "smi_oversold"    : "① تشبع بيعي SMI ✅",
-    "active_skip"     : "② أولوية الفريم الأكبر ✅",
+    "active_skip"     : "② تأكيد SMI على الفريم الأكبر ✅",
     "macd_red"        : "③ MACD أحمر ✅",
     "donchian_entry"  : "④ Donchian Ribbon أخضر ✅",
     "donchian_confirm": "⑤ Donchian Confirm أخضر ✅",
@@ -547,7 +527,7 @@ def send_diag_report():
         send_telegram(build_diag_msg(reset=True))
 
 # ──────────────────────────────────────────────
-# scan_symbol
+# scan_symbol — ✅ الإصلاح الجذري لمنطق أولوية الفريمات
 # ──────────────────────────────────────────────
 def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
     raw_ec = get_cached(symbol, ec_api)
@@ -559,7 +539,7 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
 
     with diag_lock: diag_counts["total"] += 1
 
-    # ① بيانات كافية
+    # بيانات كافية
     if raw_ec.empty or len(raw_ec) < 50 or raw_t.empty or len(raw_t) < 50:
         with diag_lock: diag_counts["no_data"] += 1
         return
@@ -572,27 +552,24 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
         with diag_lock: diag_counts["no_data"] += 1
         return
 
-    # ① SMI + ② أولوية الفريم الأكبر
-    smi_ok = check_smi_oversold(df_entry)
-
-    with smi_state_lock:
-        if smi_ok:
-            current = smi_state.get(symbol)
-            if current is None or entry_min >= current:
-                smi_state[symbol] = entry_min
-                log.info(
-                    f"🔄 {symbol}: تشبع بيعي {entry_min}m → smi_state={entry_min}"
-                    + (f" (ألغى {current}m)" if current and current != entry_min else "")
-                )
-        active = smi_state.get(symbol)
-
-    if not smi_ok:
+    # ① SMI تشبع بيعي على فريم الدخول
+    if not check_smi_oversold(df_entry):
         with diag_lock: diag_counts["smi_oversold"] += 1
         return
 
-    if active != entry_min:
-        with diag_lock: diag_counts["active_skip"] += 1
-        return
+    # ② ✅ تأكيد SMI على الفريم الأكبر مباشرة (تأكيد لا حاجب)
+    # كل فريم يتحقق فقط من الفريم الأعلى منه مباشرة في السلسلة
+    # مثال: 9m يتحقق من 12m فقط، و60m يتحقق من 90m فقط
+    next_tf = NEXT_TF.get(entry_min)
+    if next_tf is not None:
+        df_next = resample_ohlcv(raw_ec, next_tf)
+        if df_next.empty or len(df_next) < 25:
+            with diag_lock: diag_counts["active_skip"] += 1
+            return
+        if not check_smi_oversold(df_next):
+            with diag_lock: diag_counts["active_skip"] += 1
+            return
+    # إن لم يوجد فريم أكبر (180m آخر الفريمات) يمر مباشرة
 
     # ③ MACD أحمر على فريم الدخول
     if not check_macd_red(df_entry):
@@ -648,8 +625,6 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
     with alerted_keys_lock:
         if key in alerted_keys: return
         alerted_keys[key] = datetime.now(timezone.utc)
-
-    clear_active_entry(symbol)
 
     price       = df_entry["close"].iloc[-1]
     now_utc     = datetime.now(timezone.utc)
@@ -737,28 +712,16 @@ def poll_telegram_commands():
                                 f"{row['price']:.6g} | {row['time'].strftime('%H:%M UTC')}"
                             )
                         send_telegram("\n".join(lines), chat_id)
-                elif txt == "/state":
-                    with smi_state_lock:
-                        active_states = dict(smi_state)
-                    if not active_states:
-                        send_telegram("📭 لا توجد عملات في حالة انتظار حالياً.", chat_id)
-                    else:
-                        lines = [f"<b>📊 حالات التشبع البيعي النشطة ({len(active_states)}):</b>\n" + "━" * 15]
-                        for sym, tf_min in sorted(active_states.items(), key=lambda x: x[1]):
-                            lines.append(f"🔸 {sym} → ينتظر دخول على <b>{tf_min}m</b>")
-                        send_telegram("\n".join(lines), chat_id)
                 elif txt == "/status":
                     with trades_lock:       cnt    = len(trades_history)
                     with alerted_keys_lock: active = len(alerted_keys)
                     with ohlcv_cache_lock:  keys   = len(ohlcv_cache)
                     with near_signals_lock: near   = len(near_signals)
-                    with smi_state_lock:    states = len(smi_state)
                     send_telegram(
                         f"🤖 البوت يعمل — KuCoin API\n"
                         f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
                         f"📊 إجمالي الإشارات: {cnt}\n"
                         f"🎯 قريبة من الإشارة (8/9): {near}\n"
-                        f"🔄 عملات في حالة انتظار: {states}\n"
                         f"🔑 تنبيهات نشطة: {active}\n"
                         f"💾 الكاش: {keys} مفتاح\n"
                         f"⚡ تحميل سريع: {'✅' if fast_prefetch_done.is_set() else '⏳'}\n"
@@ -792,7 +755,6 @@ def poll_telegram_commands():
                         send_telegram("⚠️ لا توجد عملات.", chat_id)
                     else:
                         fast_prefetch_done.clear(); prefetch_done.clear()
-                        with smi_state_lock: smi_state.clear()
                         threading.Thread(target=prefetch_all, args=(syms,), daemon=True).start()
                         send_telegram(f"🚀 بدأ إعادة التحميل لـ {len(syms)} عملة...", chat_id)
                 elif txt == "/help":
@@ -802,7 +764,6 @@ def poll_telegram_commands():
                         "2️⃣  <code>2</code> — إشارات أمس\n"
                         "3️⃣  <code>3</code> — آخر 7 أيام\n"
                         "🎯  <code>/top6</code> — عملات اجتازت 8 شروط\n"
-                        "📊  <code>/state</code> — عملات في حالة انتظار\n"
                         "📊  <code>/status</code> — حالة البوت\n"
                         "🔬  <code>/cache</code> — فحص الكاش\n"
                         "🧪  <code>/fetchtest</code> — اختبار KuCoin\n"
