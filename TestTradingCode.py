@@ -16,7 +16,7 @@ log = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "8298845980:AAFrhgrdngO6b1vV9poLyw7c_yT0afTkMg4")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "-1003853071475")
-TOP_SYMBOLS_LIMIT = 70
+TOP_SYMBOLS_LIMIT = 100
 PORT = int(os.environ.get("PORT", "8080"))
 ALERT_EXPIRY_HOURS = 4
 
@@ -51,7 +51,7 @@ alerted_keys       = {}
 alerted_keys_lock  = threading.Lock()
 trades_history     = deque(maxlen=2000)
 trades_lock        = threading.Lock()
-near_signals       = {}          # ✅ تغيير: dict بدل deque
+near_signals       = {}
 near_signals_lock  = threading.Lock()
 symbols_cache      = []
 symbols_cache_lock = threading.Lock()
@@ -264,7 +264,7 @@ def prefetch_all(symbols):
                     log.error(f"fast prefetch {sym} {tf} ({attempt+1}): {e}")
                     time.sleep(attempt + 1)
             if not fetched: fast_failed += 1
-            time.sleep(0.2)
+            time.sleep(0.25)
         if (i + 1) % 10 == 0 or i == total - 1:
             log.info(f"⚡ سريع: {i+1}/{total} | نجح: {fast_success} | فشل: {fast_failed}")
 
@@ -294,7 +294,7 @@ def prefetch_all(symbols):
                 df = get_ohlcv_full(sym, tf, target=n)
                 if not df.empty:
                     cache_merge(sym, tf, df); full_success += 1
-                time.sleep(0.2)
+                time.sleep(0.25)
             except Exception as e:
                 log.error(f"full prefetch {sym} {tf}: {e}")
         if (i + 1) % 10 == 0 or i == total - 1:
@@ -405,15 +405,14 @@ def check_ema50_below(df):
     ema = df["close"].ewm(span=50, adjust=False).mean()
     return bool(df["close"].iloc[-1] < ema.iloc[-1])
 
-# ✅ تصحيح SMI ليطابق TradingView — EMA واحدة فقط
 def calc_smi(high, low, close, k=10, d=3, ema_len=10, smooth=1):
     hh    = high.rolling(k).max()
     ll    = low.rolling(k).min()
     diff  = hh - ll
     rdiff = close - (hh + ll) / 2
 
-    avgrel  = rdiff.ewm(span=d, adjust=False).mean()   # ← EMA واحدة فقط (مطابق TradingView)
-    avgdiff = diff.ewm(span=d, adjust=False).mean()    # ← EMA واحدة فقط (مطابق TradingView)
+    avgrel  = rdiff.ewm(span=d, adjust=False).mean()
+    avgdiff = diff.ewm(span=d, adjust=False).mean()
 
     smi_arr = np.where(avgdiff != 0, (avgrel / (avgdiff / 2)) * 100, 0.0)
     smi = pd.Series(smi_arr, index=close.index)
@@ -438,7 +437,6 @@ def calc_rsi_tv(close, period=14):
     loss  = (-delta.clip(upper=0))
     return 100 - (100 / (1 + wilder_rma(gain, period) / (wilder_rma(loss, period) + 1e-10)))
 
-# ✅ تصحيح check_rsi_stoch — indices حقيقية + منطق أوضح
 def check_rsi_stoch(df, lookback=10):
     if len(df) < 50:
         return False
@@ -454,11 +452,9 @@ def check_rsi_stoch(df, lookback=10):
     rsi    = calc_rsi_tv(close, period=14)
     rsi_ma = rsi.rolling(14).mean()
 
-    # لازم RSI يدخل منطقة التشبع البيعي فعلاً
     if rsi.iloc[-20:].min() > 35:
         return False
 
-    # نبحث عن تقاطع RSI حديث باستخدام indices حقيقية
     rsi_cross_idx = None
     for i in range(len(df) - lookback, len(df)):
         if (
@@ -474,7 +470,6 @@ def check_rsi_stoch(df, lookback=10):
     cross_20 = False
     cross_d  = False
 
-    # نبدأ بعد نقطة التقاطع فقط
     for i in range(rsi_cross_idx + 1, len(df)):
         if not cross_20:
             if k.iloc[i - 1] <= 20 and k.iloc[i] > 20:
@@ -561,14 +556,12 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
 
     with diag_lock: diag_counts["total"] += 1
 
-    # ✅ near_key يُعرَّف هنا لاستخدامه في clear_near
     near_key = f"{symbol}_{entry_min}"
 
     def clear_near():
         with near_signals_lock:
             near_signals.pop(near_key, None)
 
-    # بيانات كافية
     if raw_ec.empty or len(raw_ec) < 50 or raw_t.empty or len(raw_t) < 50:
         with diag_lock: diag_counts["no_data"] += 1
         clear_near()
@@ -583,60 +576,51 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
         clear_near()
         return
 
-    # ① SMI تشبع بيعي على فريم الدخول
     if not check_smi_oversold(df_entry):
         with diag_lock: diag_counts["smi_oversold"] += 1
         clear_near()
         return
 
-    # ② إذا الفريم الأكبر مباشرة فيه تشبع بيعي → تجاهل الأصغر وانتظر الأكبر
     next_tf = NEXT_TF.get(entry_min)
     if next_tf is not None:
         df_next = resample_ohlcv(raw_ec, next_tf)
         if not df_next.empty and len(df_next) >= 25:
-            if check_smi_oversold(df_next):   # ✅ الأكبر oversold → تجاهل الأصغر
+            if check_smi_oversold(df_next):
                 with diag_lock: diag_counts["active_skip"] += 1
                 clear_near()
                 return
 
-    # ③ MACD أحمر على فريم الدخول
     if not check_macd_red(df_entry):
         with diag_lock: diag_counts["macd_red"] += 1
         clear_near()
         return
 
-    # ④ Donchian Trend Ribbon أخضر على فريم الدخول
     if not check_donchian_ribbon(df_entry, direction="green"):
         with diag_lock: diag_counts["donchian_entry"] += 1
         clear_near()
         return
 
-    # ⑤ Donchian Trend Ribbon أخضر على فريم التأكيد
     if not check_donchian_ribbon(df_confirm, direction="green"):
         with diag_lock: diag_counts["donchian_confirm"] += 1
         clear_near()
         return
 
-    # ⑥ MACD أخضر على فريم التأكيد
     if not check_macd_green(df_confirm):
         with diag_lock: diag_counts["macd_confirm"] += 1
         clear_near()
         return
 
-    # ⑦ EMA50 — السعر تحت الخط
     if not check_ema50_below(df_entry):
         with diag_lock: diag_counts["ema50"] += 1
         clear_near()
         return
 
-    # ⑧ RSI تقاطع + Stochastic على فريم الدخول (÷3)
     if not check_rsi_stoch(df_third):
         with diag_lock:
             diag_counts["rsi_stoch"] += 1
 
         price = df_entry["close"].iloc[-1]
 
-        # ✅ near_signals كـ dict — كل عملة لها مكان واحد فقط
         with near_signals_lock:
             near_signals[near_key] = {
                 "time"  : datetime.now(timezone.utc),
@@ -646,10 +630,8 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
             }
         return
 
-    # ✅ نجح الشرط الأخير — احذفها من near_signals
     clear_near()
 
-    # ✅ كل الشروط اتحققت
     with diag_lock: diag_counts["passed"] += 1
 
     last_ts = df_entry["ts"].iloc[-1].strftime("%Y%m%d%H%M") if "ts" in df_entry.columns else "x"
@@ -698,7 +680,7 @@ def candle_watcher(entry_min, confirm_min, third_min, ec_api, t_api):
             entry_min=entry_min, confirm_min=confirm_min,
             third_min=third_min, ec_api=ec_api, t_api=t_api,
         )
-        with ThreadPoolExecutor(max_workers=4) as ex:
+        with ThreadPoolExecutor(max_workers=6) as ex:
             ex.map(fn, syms)
 
 # ──────────────────────────────────────────────
@@ -734,7 +716,6 @@ def poll_telegram_commands():
                     )
                 elif txt == "/top6":
                     with near_signals_lock:
-                        # ✅ near_signals الآن dict
                         rows = list(near_signals.values())[-30:]
                     if not rows:
                         send_telegram("⏳ لا توجد عملات وصلت للشرط الأخير بعد.", chat_id)
