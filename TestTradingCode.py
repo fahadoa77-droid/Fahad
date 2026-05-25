@@ -1,3 +1,4 @@
+
 import os
 import requests
 import pandas as pd
@@ -423,10 +424,12 @@ def calc_smi(high, low, close, k=10, d=3, ema_len=10, smooth=1):
     sig = smi.ewm(span=ema_len, adjust=False).mean()
     return smi, sig
 
-def check_smi_oversold(df, threshold=-40, lookback=5):
+# ✅ التعديل: إغلاق آخر شمعة مكتملة تحت -40 (وليس مجرد لمس)
+def check_smi_oversold(df, threshold=-40):
     if len(df) < 30: return False
     smi, _ = calc_smi(df["high"], df["low"], df["close"])
-    return bool(smi.iloc[-lookback:].min() <= threshold)
+    # إغلاق الشمعة الأخيرة المكتملة يجب أن يكون تحت -40
+    return bool(smi.iloc[-1] <= threshold)
 
 def wilder_rma(series, period):
     return series.ewm(alpha=1/period, adjust=False).mean()
