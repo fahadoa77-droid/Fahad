@@ -51,7 +51,7 @@ alerted_keys       = {}
 alerted_keys_lock  = threading.Lock()
 trades_history     = deque(maxlen=2000)
 trades_lock        = threading.Lock()
-near_signals       = deque(maxlen=500)
+near_signals       = {}          # ✅ تغيير: dict بدل deque
 near_signals_lock  = threading.Lock()
 symbols_cache      = []
 symbols_cache_lock = threading.Lock()
@@ -405,15 +405,23 @@ def check_ema50_below(df):
     ema = df["close"].ewm(span=50, adjust=False).mean()
     return bool(df["close"].iloc[-1] < ema.iloc[-1])
 
-def calc_smi(high, low, close, k=10, d=3, ema=10, smooth=1):
-    hh  = high.rolling(k).max()
-    ll  = low.rolling(k).min()
-    mid = (hh + ll) / 2
-    ds  = (close - mid).ewm(span=d, adjust=False).mean().ewm(span=d, adjust=False).mean()
-    hls = ((hh - ll) / 2).ewm(span=d, adjust=False).mean().ewm(span=d, adjust=False).mean()
-    smi = 200 * ds / (hls.abs() + 1e-10)
-    if smooth > 1: smi = smi.rolling(smooth).mean()
-    sig = smi.ewm(span=ema, adjust=False).mean()
+# ✅ تصحيح SMI ليطابق TradingView — EMA واحدة فقط
+def calc_smi(high, low, close, k=10, d=3, ema_len=10, smooth=1):
+    hh    = high.rolling(k).max()
+    ll    = low.rolling(k).min()
+    diff  = hh - ll
+    rdiff = close - (hh + ll) / 2
+
+    avgrel  = rdiff.ewm(span=d, adjust=False).mean()   # ← EMA واحدة فقط (مطابق TradingView)
+    avgdiff = diff.ewm(span=d, adjust=False).mean()    # ← EMA واحدة فقط (مطابق TradingView)
+
+    smi_arr = np.where(avgdiff != 0, (avgrel / (avgdiff / 2)) * 100, 0.0)
+    smi = pd.Series(smi_arr, index=close.index)
+
+    if smooth > 1:
+        smi = smi.rolling(smooth).mean()
+
+    sig = smi.ewm(span=ema_len, adjust=False).mean()
     return smi, sig
 
 def check_smi_oversold(df, threshold=-40, lookback=5):
@@ -430,8 +438,11 @@ def calc_rsi_tv(close, period=14):
     loss  = (-delta.clip(upper=0))
     return 100 - (100 / (1 + wilder_rma(gain, period) / (wilder_rma(loss, period) + 1e-10)))
 
+# ✅ تصحيح check_rsi_stoch — indices حقيقية + منطق أوضح
 def check_rsi_stoch(df, lookback=10):
-    if len(df) < 50: return False
+    if len(df) < 50:
+        return False
+
     close, high, low = df["close"], df["high"], df["low"]
 
     lo15  = low.rolling(15).min()
@@ -442,24 +453,35 @@ def check_rsi_stoch(df, lookback=10):
 
     rsi    = calc_rsi_tv(close, period=14)
     rsi_ma = rsi.rolling(14).mean()
-    if rsi.iloc[-20:].min() > 35: return False
 
+    # لازم RSI يدخل منطقة التشبع البيعي فعلاً
+    if rsi.iloc[-20:].min() > 35:
+        return False
+
+    # نبحث عن تقاطع RSI حديث باستخدام indices حقيقية
     rsi_cross_idx = None
-    for i in range(-lookback, 0):
-        if rsi.iloc[i-1] < rsi_ma.iloc[i-1] and rsi.iloc[i] >= rsi_ma.iloc[i]:
+    for i in range(len(df) - lookback, len(df)):
+        if (
+            rsi.iloc[i - 1] < rsi_ma.iloc[i - 1]
+            and rsi.iloc[i] >= rsi_ma.iloc[i]
+        ):
             rsi_cross_idx = i
             break
 
-    if rsi_cross_idx is None: return False
+    if rsi_cross_idx is None:
+        return False
 
     cross_20 = False
     cross_d  = False
 
-    for i in range(rsi_cross_idx, 0):
-        if not cross_20 and k.iloc[i-1] <= 20 and k.iloc[i] > 20:
-            cross_20 = True
-        if not cross_d and k.iloc[i-1] <= d.iloc[i-1] and k.iloc[i] > d.iloc[i]:
-            cross_d = True
+    # نبدأ بعد نقطة التقاطع فقط
+    for i in range(rsi_cross_idx + 1, len(df)):
+        if not cross_20:
+            if k.iloc[i - 1] <= 20 and k.iloc[i] > 20:
+                cross_20 = True
+        if not cross_d:
+            if k.iloc[i - 1] <= d.iloc[i - 1] and k.iloc[i] > d.iloc[i]:
+                cross_d = True
 
     return cross_20 and cross_d
 
@@ -527,7 +549,7 @@ def send_diag_report():
         send_telegram(build_diag_msg(reset=True))
 
 # ──────────────────────────────────────────────
-# scan_symbol — ✅ الإصلاح الجذري لمنطق أولوية الفريمات
+# scan_symbol
 # ──────────────────────────────────────────────
 def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
     raw_ec = get_cached(symbol, ec_api)
@@ -539,9 +561,17 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
 
     with diag_lock: diag_counts["total"] += 1
 
+    # ✅ near_key يُعرَّف هنا لاستخدامه في clear_near
+    near_key = f"{symbol}_{entry_min}"
+
+    def clear_near():
+        with near_signals_lock:
+            near_signals.pop(near_key, None)
+
     # بيانات كافية
     if raw_ec.empty or len(raw_ec) < 50 or raw_t.empty or len(raw_t) < 50:
         with diag_lock: diag_counts["no_data"] += 1
+        clear_near()
         return
 
     df_entry   = resample_ohlcv(raw_ec, entry_min)
@@ -550,71 +580,77 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
 
     if any(d.empty or len(d) < 25 for d in [df_entry, df_confirm, df_third]):
         with diag_lock: diag_counts["no_data"] += 1
+        clear_near()
         return
 
     # ① SMI تشبع بيعي على فريم الدخول
     if not check_smi_oversold(df_entry):
         with diag_lock: diag_counts["smi_oversold"] += 1
+        clear_near()
         return
 
-    # ② ✅ تأكيد SMI على الفريم الأكبر مباشرة (تأكيد لا حاجب)
-    # كل فريم يتحقق فقط من الفريم الأعلى منه مباشرة في السلسلة
-    # مثال: 9m يتحقق من 12m فقط، و60m يتحقق من 90m فقط
+    # ② تأكيد SMI على الفريم الأكبر مباشرة
     next_tf = NEXT_TF.get(entry_min)
     if next_tf is not None:
         df_next = resample_ohlcv(raw_ec, next_tf)
         if df_next.empty or len(df_next) < 25:
             with diag_lock: diag_counts["active_skip"] += 1
+            clear_near()
             return
         if not check_smi_oversold(df_next):
             with diag_lock: diag_counts["active_skip"] += 1
+            clear_near()
             return
-    # إن لم يوجد فريم أكبر (180m آخر الفريمات) يمر مباشرة
 
     # ③ MACD أحمر على فريم الدخول
     if not check_macd_red(df_entry):
         with diag_lock: diag_counts["macd_red"] += 1
+        clear_near()
         return
 
     # ④ Donchian Trend Ribbon أخضر على فريم الدخول
     if not check_donchian_ribbon(df_entry, direction="green"):
         with diag_lock: diag_counts["donchian_entry"] += 1
+        clear_near()
         return
 
-    # ⑤ Donchian Trend Ribbon أخضر على فريم التأكيد (×3)
+    # ⑤ Donchian Trend Ribbon أخضر على فريم التأكيد
     if not check_donchian_ribbon(df_confirm, direction="green"):
         with diag_lock: diag_counts["donchian_confirm"] += 1
+        clear_near()
         return
 
-    # ⑥ MACD أخضر على فريم التأكيد (×3)
+    # ⑥ MACD أخضر على فريم التأكيد
     if not check_macd_green(df_confirm):
         with diag_lock: diag_counts["macd_confirm"] += 1
+        clear_near()
         return
 
     # ⑦ EMA50 — السعر تحت الخط
     if not check_ema50_below(df_entry):
         with diag_lock: diag_counts["ema50"] += 1
+        clear_near()
         return
 
     # ⑧ RSI تقاطع + Stochastic على فريم الدخول (÷3)
     if not check_rsi_stoch(df_third):
-        with diag_lock: diag_counts["rsi_stoch"] += 1
+        with diag_lock:
+            diag_counts["rsi_stoch"] += 1
+
         price = df_entry["close"].iloc[-1]
 
-        near_key = f"{symbol}_{entry_min}"
+        # ✅ near_signals كـ dict — كل عملة لها مكان واحد فقط
         with near_signals_lock:
-            existing_keys = {
-                f"{r['symbol']}_{r['tf'].split('/')[0].replace('m', '')}"
-                for r in near_signals
+            near_signals[near_key] = {
+                "time"  : datetime.now(timezone.utc),
+                "symbol": symbol,
+                "price" : price,
+                "tf"    : f"{entry_min}m/{confirm_min}m/{third_min}m",
             }
-            if near_key not in existing_keys:
-                near_signals.append({
-                    "time"  : datetime.now(timezone.utc),
-                    "symbol": symbol,
-                    "price" : price,
-                    "tf"    : f"{entry_min}m/{confirm_min}m/{third_min}m",
-                })
         return
+
+    # ✅ نجح الشرط الأخير — احذفها من near_signals
+    clear_near()
 
     # ✅ كل الشروط اتحققت
     with diag_lock: diag_counts["passed"] += 1
@@ -701,11 +737,12 @@ def poll_telegram_commands():
                     )
                 elif txt == "/top6":
                     with near_signals_lock:
-                        rows = list(near_signals)[-30:]
+                        # ✅ near_signals الآن dict
+                        rows = list(near_signals.values())[-30:]
                     if not rows:
                         send_telegram("⏳ لا توجد عملات وصلت للشرط الأخير بعد.", chat_id)
                     else:
-                        lines = [f"<b>🎯 عملات اجتازت 8 شروط — RSI/Stoch فقط باقي ({len(rows)}):</b>\n" + "━" * 15]
+                        lines = [f"<b>🎯 عملات قريبة من الإشارة — RSI/Stoch فقط باقي ({len(rows)}):</b>\n" + "━" * 15]
                         for row in reversed(rows):
                             lines.append(
                                 f"🔸 {row['symbol']} | {row['tf']} | "
@@ -763,7 +800,7 @@ def poll_telegram_commands():
                         "1️⃣  <code>1</code> — إشارات اليوم\n"
                         "2️⃣  <code>2</code> — إشارات أمس\n"
                         "3️⃣  <code>3</code> — آخر 7 أيام\n"
-                        "🎯  <code>/top6</code> — عملات اجتازت 8 شروط\n"
+                        "🎯  <code>/top6</code> — عملات قريبة من الإشارة\n"
                         "📊  <code>/status</code> — حالة البوت\n"
                         "🔬  <code>/cache</code> — فحص الكاش\n"
                         "🧪  <code>/fetchtest</code> — اختبار KuCoin\n"
