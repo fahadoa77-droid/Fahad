@@ -20,6 +20,9 @@ TOP_SYMBOLS_LIMIT = 100
 PORT = int(os.environ.get("PORT", "8080"))
 ALERT_EXPIRY_HOURS = 4
 
+# مدة انتهاء صلاحية near_signals_6 (بالساعات)
+NEAR6_EXPIRY_HOURS = 2
+
 KUCOIN_BASE = "https://api.kucoin.com"
 TF_MAP = {"1m": "1min", "60m": "1hour"}
 
@@ -53,6 +56,7 @@ trades_history     = deque(maxlen=2000)
 trades_lock        = threading.Lock()
 near_signals       = {}
 near_signals_lock  = threading.Lock()
+# near_signals_6: العملات المحجوبة بالفريم الأكبر — تنتهي بعد NEAR6_EXPIRY_HOURS
 near_signals_6     = {}
 near_signals_6_lock = threading.Lock()
 symbols_cache      = []
@@ -115,6 +119,14 @@ def cleanup_alerted_keys():
         expired = [k for k, t in list(alerted_keys.items())
                    if now - t > timedelta(hours=ALERT_EXPIRY_HOURS)]
         for k in expired: del alerted_keys[k]
+
+def cleanup_near6():
+    """حذف المحجوبات القديمة تلقائياً"""
+    now = datetime.now(timezone.utc)
+    with near_signals_6_lock:
+        expired = [k for k, v in list(near_signals_6.items())
+                   if now - v["time"] > timedelta(hours=NEAR6_EXPIRY_HOURS)]
+        for k in expired: del near_signals_6[k]
 
 def save_signal(symbol, price, entry_min, confirm_min, third_min):
     with trades_lock:
@@ -425,11 +437,16 @@ def calc_smi(high, low, close, k=10, d=3, ema_len=10, smooth=1):
     sig = smi.ewm(span=ema_len, adjust=False).mean()
     return smi, sig
 
-# ✅ التعديل: كلا الخطين (SMI والسيجنال) تحت -40
 def check_smi_oversold(df, threshold=-40):
     if len(df) < 30: return False
     smi, sig = calc_smi(df["high"], df["low"], df["close"])
-    return bool(smi.iloc[-1] <= threshold and sig.iloc[-1] <= threshold)
+    return bool(smi.iloc[-1] <= threshold)  # الخط الأسود (K) فقط
+
+def get_smi_value(df, threshold=-40):
+    """إرجاع قيمة SMI الحالية"""
+    if len(df) < 30: return None, None
+    smi, sig = calc_smi(df["high"], df["low"], df["close"])
+    return round(float(smi.iloc[-1]), 2), round(float(sig.iloc[-1]), 2)
 
 def wilder_rma(series, period):
     return series.ewm(alpha=1/period, adjust=False).mean()
@@ -440,12 +457,10 @@ def calc_rsi_tv(close, period=14):
     loss  = (-delta.clip(upper=0))
     return 100 - (100 / (1 + wilder_rma(gain, period) / (wilder_rma(loss, period) + 1e-10)))
 
-# ✅ التعديل: lookback=10، إضافة %D، ثلاثة شروط معاً
 def check_rsi_stoch(df, lookback=10):
     if len(df) < 50: return False
     close, high, low = df["close"], df["high"], df["low"]
 
-    # RSI تقاطع إيجابي فوق MA
     rsi    = calc_rsi_tv(close, period=14)
     rsi_ma = rsi.rolling(14).mean()
     if rsi.iloc[-20:].min() > 35: return False
@@ -456,20 +471,17 @@ def check_rsi_stoch(df, lookback=10):
     )
     if not rsi_cross: return False
 
-    # Stochastic K=15, smooth_k=3, smooth_d=3
     lo15  = low.rolling(15).min()
     hi15  = high.rolling(15).max()
     k_raw = 100 * (close - lo15) / (hi15 - lo15 + 1e-10)
-    k     = k_raw.rolling(3).mean()   # %K المنعّم (الأزرق)
-    d     = k.rolling(3).mean()       # %D (البرتقالي)
+    k     = k_raw.rolling(3).mean()
+    d     = k.rolling(3).mean()
 
-    # %K يعبر فوق 20
     cross_20 = any(
         k.iloc[i-1] <= 20 and k.iloc[i] > 20
         for i in range(-lookback, 0)
     )
 
-    # %K يعبر فوق %D
     cross_d = any(
         k.iloc[i-1] <= d.iloc[i-1] and k.iloc[i] > d.iloc[i]
         for i in range(-lookback, 0)
@@ -483,7 +495,7 @@ def check_rsi_stoch(df, lookback=10):
 DIAG_LABELS = {
     "no_data"         : "بيانات ناقصة",
     "smi_oversold"    : "SMI مش في التشبع البيعي",
-    "active_skip"     : "SMI الفريم الأكبر لم يتأكد",
+    "active_skip"     : "⭐ الفريم الأكبر في تشبع بيعي (تم إلغاؤها)",
     "macd_red"        : "MACD الرئيسي مش أحمر",
     "donchian_entry"  : "Donchian Ribbon الرئيسي مش أخضر",
     "donchian_confirm": "Donchian Ribbon Confirm مش أخضر",
@@ -495,7 +507,7 @@ DIAG_LABELS = {
 STEP_LABELS = {
     "no_data"         : "بيانات كافية ✅",
     "smi_oversold"    : "① تشبع بيعي SMI ✅",
-    "active_skip"     : "② تأكيد SMI على الفريم الأكبر ✅",
+    "active_skip"     : "⭐ الفريم الأكبر ليس في تشبع بيعي ✅",
     "macd_red"        : "③ MACD أحمر ✅",
     "donchian_entry"  : "④ Donchian Ribbon أخضر ✅",
     "donchian_confirm": "⑤ Donchian Confirm أخضر ✅",
@@ -553,7 +565,6 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
 
     with diag_lock: diag_counts["total"] += 1
 
-    # ✅ التعديل: key منفصل لكل زوج timeframes
     near_key = f"{symbol}_{entry_min}_{confirm_min}_{third_min}"
 
     if raw_ec.empty or len(raw_ec) < 50 or raw_t.empty or len(raw_t) < 50:
@@ -568,28 +579,36 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
         with diag_lock: diag_counts["no_data"] += 1
         return
 
-    # ① تشبع بيعي SMI — احفظ في near_signals_6 قبل active_skip
+    # ① تشبع بيعي SMI
     if not check_smi_oversold(df_entry):
         with diag_lock: diag_counts["smi_oversold"] += 1
         return
 
-    # ② active_skip
+    # ⭐ active_skip — لو الفريم الأكبر في تشبع بيعي → ألغِ نهائياً
     next_tf = NEXT_TF.get(entry_min)
     if next_tf is not None:
         df_next = resample_ohlcv(raw_ec, next_tf)
         if not df_next.empty and len(df_next) >= 25:
             if check_smi_oversold(df_next):
-                # ✅ احفظ في near_signals_6 — تشبع بيعي لكن الفريم الأكبر يمنعه
+                # احفظ في near_signals_6 مع قيمة SMI للفريم الأكبر
+                smi_val, sig_val = get_smi_value(df_next)
                 with near_signals_6_lock:
                     near_signals_6[near_key] = {
-                        "time"  : datetime.now(timezone.utc),
-                        "symbol": symbol,
-                        "price" : df_entry["close"].iloc[-1],
-                        "tf"    : f"{entry_min}m/{confirm_min}m/{third_min}m",
-                        "stage" : "تشبع بيعي — الفريم الأكبر يمنعه",
+                        "time"      : datetime.now(timezone.utc),
+                        "symbol"    : symbol,
+                        "price"     : df_entry["close"].iloc[-1],
+                        "tf"        : f"{entry_min}m/{confirm_min}m/{third_min}m",
+                        "next_tf"   : next_tf,
+                        "smi_next"  : smi_val,
+                        "sig_next"  : sig_val,
+                        "stage"     : f"محجوبة — الفريم {next_tf}m في تشبع بيعي",
                     }
                 with diag_lock: diag_counts["active_skip"] += 1
                 return
+
+    # إذا وصلت هنا = الفريم الأكبر لا يمنعها → احذفها من near_signals_6 لو كانت محفوظة
+    with near_signals_6_lock:
+        near_signals_6.pop(near_key, None)
 
     if not check_macd_red(df_entry):
         with diag_lock: diag_counts["macd_red"] += 1
@@ -603,12 +622,12 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
         with diag_lock: diag_counts["donchian_confirm"] += 1
         return
 
-    # ⑥ MACD Confirm — أرسل تنبيه مبكر لو اجتاز
+    # ⑥ MACD Confirm — تنبيه مبكر
     if not check_macd_green(df_confirm):
         with diag_lock: diag_counts["macd_confirm"] += 1
         return
 
-    # ✅ اجتاز 6 شروط — أرسل تنبيه مبكر
+    # اجتاز 6 شروط — تنبيه مبكر
     early_key = f"EARLY_{near_key}"
     with alerted_keys_lock:
         if early_key not in alerted_keys:
@@ -684,6 +703,7 @@ def candle_watcher(entry_min, confirm_min, third_min, ec_api, t_api):
         wait = (nxt - datetime.now(timezone.utc)).total_seconds()
         time.sleep(max(wait, 0) + 2.0)
         cleanup_alerted_keys()
+        cleanup_near6()
         if not fast_prefetch_done.is_set(): continue
         with symbols_cache_lock: syms = list(symbols_cache)
         if not syms: continue
@@ -727,30 +747,54 @@ def poll_telegram_commands():
                         "⚠️ لا توجد بيانات." if diag_counts["total"] == 0
                         else build_diag_msg(reset=False), chat_id
                     )
+
                 elif txt == "/top6":
+                    # العملات اللي وصلت شرط 7/8 (باقي RSI/Stoch فقط)
+                    now = datetime.now(timezone.utc)
                     with near_signals_lock:
                         rows8 = list(near_signals.values())
-                    with near_signals_6_lock:
-                        rows6 = list(near_signals_6.values())
 
-                    lines = []
-                    if rows8:
-                        lines.append(f"<b>🔴 شرط 8 فقط باقي ({len(rows8)}):</b>\n" + "━" * 15)
-                        for r in reversed(rows8):
-                            lines.append(
-                                f"🔸 {r['symbol']} | {r['tf']} | "
-                                f"{r['price']:.6g} | {r['time'].strftime('%H:%M UTC')}"
-                            )
-                    if rows6:
-                        lines.append(f"\n<b>🟡 تشبع بيعي — الفريم الأكبر يمنعه ({len(rows6)}):</b>\n" + "━" * 15)
-                        for r in reversed(rows6):
-                            lines.append(
-                                f"🔹 {r['symbol']} | {r['tf']} | "
-                                f"{r['price']:.6g} | {r['time'].strftime('%H:%M UTC')}"
-                            )
-                    if not lines:
-                        send_telegram("⏳ لا توجد عملات بعد.", chat_id)
+                    if not rows8:
+                        send_telegram("⏳ لا توجد عملات قريبة من الإشارة (7/8).", chat_id)
                     else:
+                        lines = [f"<b>🔴 باقي شرط واحد فقط — RSI/Stoch ({len(rows8)}):</b>\n" + "━" * 15]
+                        for row in reversed(rows8):
+                            age = int((now - row["time"]).total_seconds() / 60)
+                            lines.append(
+                                f"🔸 {row['symbol']} | {row['tf']} | "
+                                f"{row['price']:.6g} | منذ {age} دقيقة"
+                            )
+                        send_telegram("\n".join(lines), chat_id)
+
+                elif txt == "/blocked":
+                    # العملات المحجوبة بالفريم الأكبر — آخر ساعتين فقط
+                    now = datetime.now(timezone.utc)
+                    with near_signals_6_lock:
+                        rows6 = [
+                            v for v in near_signals_6.values()
+                            if now - v["time"] <= timedelta(hours=NEAR6_EXPIRY_HOURS)
+                        ]
+
+                    if not rows6:
+                        send_telegram(
+                            f"⏳ لا توجد عملات محجوبة خلال آخر {NEAR6_EXPIRY_HOURS} ساعات.",
+                            chat_id
+                        )
+                    else:
+                        lines = [
+                            f"<b>⭐ محجوبة بالفريم الأكبر ({len(rows6)}) — آخر {NEAR6_EXPIRY_HOURS}س:</b>\n"
+                            + "━" * 15
+                        ]
+                        for row in reversed(rows6):
+                            age = int((now - row["time"]).total_seconds() / 60)
+                            smi_txt = (
+                                f" | SMI الفريم {row['next_tf']}m: {row['smi_next']}/{row['sig_next']}"
+                                if row.get("smi_next") is not None else ""
+                            )
+                            lines.append(
+                                f"🔹 {row['symbol']} | {row['tf']} | "
+                                f"{row['price']:.6g}{smi_txt} | منذ {age} دقيقة"
+                            )
                         send_telegram("\n".join(lines), chat_id)
 
                 elif txt == "/status":
@@ -763,8 +807,8 @@ def poll_telegram_commands():
                         f"🤖 البوت يعمل — KuCoin API\n"
                         f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
                         f"📊 إجمالي الإشارات: {cnt}\n"
-                        f"🔴 قريبة من الإشارة (8/8): {near}\n"
-                        f"🟡 تشبع بيعي محجوب: {near6}\n"
+                        f"🔴 قريبة من الإشارة (7/8): {near}\n"
+                        f"⭐ محجوبة بالفريم الأكبر: {near6}\n"
                         f"🔑 تنبيهات نشطة: {active}\n"
                         f"💾 الكاش: {keys} مفتاح\n"
                         f"⚡ تحميل سريع: {'✅' if fast_prefetch_done.is_set() else '⏳'}\n"
@@ -806,8 +850,8 @@ def poll_telegram_commands():
                         "1️⃣  <code>1</code> — إشارات اليوم\n"
                         "2️⃣  <code>2</code> — إشارات أمس\n"
                         "3️⃣  <code>3</code> — آخر 7 أيام\n"
-                        "🔴  <code>/top6</code> — عملات قريبة من الإشارة\n"
-                        "🟡  <code>/top6</code> — تشبع بيعي محجوب بالفريم الأكبر\n"
+                        "🔴  <code>/top6</code> — عملات وصلت 7/8 شروط (باقي RSI/Stoch)\n"
+                        "⭐  <code>/blocked</code> — عملات محجوبة بالفريم الأكبر\n"
                         "📊  <code>/status</code> — حالة البوت\n"
                         "🔬  <code>/cache</code> — فحص الكاش\n"
                         "🧪  <code>/fetchtest</code> — اختبار KuCoin\n"
