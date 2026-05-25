@@ -589,18 +589,15 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
         clear_near()
         return
 
-    # ② تأكيد SMI على الفريم الأكبر مباشرة
+    # ② إذا الفريم الأكبر مباشرة فيه تشبع بيعي → تجاهل الأصغر وانتظر الأكبر
     next_tf = NEXT_TF.get(entry_min)
     if next_tf is not None:
         df_next = resample_ohlcv(raw_ec, next_tf)
-        if df_next.empty or len(df_next) < 25:
-            with diag_lock: diag_counts["active_skip"] += 1
-            clear_near()
-            return
-        if not check_smi_oversold(df_next):
-            with diag_lock: diag_counts["active_skip"] += 1
-            clear_near()
-            return
+        if not df_next.empty and len(df_next) >= 25:
+            if check_smi_oversold(df_next):   # ✅ الأكبر oversold → تجاهل الأصغر
+                with diag_lock: diag_counts["active_skip"] += 1
+                clear_near()
+                return
 
     # ③ MACD أحمر على فريم الدخول
     if not check_macd_red(df_entry):
