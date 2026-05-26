@@ -19,8 +19,6 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "-1003853071475")
 TOP_SYMBOLS_LIMIT = 100
 PORT = int(os.environ.get("PORT", "8080"))
 ALERT_EXPIRY_HOURS = 4
-
-# مدة انتهاء صلاحية near_signals_6 (بالساعات)
 NEAR6_EXPIRY_HOURS = 2
 
 KUCOIN_BASE = "https://api.kucoin.com"
@@ -50,39 +48,49 @@ API_FETCH_CANDLES  = {"1m": 15_000, "60m": 2_000}
 CACHE_MAX_CANDLES  = {"1m": 16_000, "60m": 2_500}
 EPOCH = pd.Timestamp("1970-01-01", tz="UTC")
 
-alerted_keys       = {}
-alerted_keys_lock  = threading.Lock()
-trades_history     = deque(maxlen=2000)
-trades_lock        = threading.Lock()
-near_signals       = {}
-near_signals_lock  = threading.Lock()
-# near_signals_6: العملات المحجوبة بالفريم الأكبر — تنتهي بعد NEAR6_EXPIRY_HOURS
-near_signals_6     = {}
+# ── Warm-up: عدد الشموع الكافي لكل مؤشر قبل القراءة ──
+# TradingView يحسب EWM من أول شمعة تاريخية
+# كلما زاد الـ warm-up كلما اقتربنا من قيمة TradingView
+WARMUP_EMA   = 200   # EMA 50 تحتاج 200 شمعة warm-up
+WARMUP_MACD  = 200   # MACD 26+9 تحتاج 200 شمعة
+WARMUP_SMI   = 100   # SMI تحتاج 100 شمعة
+WARMUP_RSI   = 200   # RSI 14 تحتاج 200 شمعة
+WARMUP_STOCH = 100   # Stochastic تحتاج 100 شمعة
+WARMUP_DON   = 50    # Donchian تحتاج 50 شمعة
+MIN_CANDLES  = 250   # الحد الأدنى للشموع في أي dataframe للفحص
+
+alerted_keys        = {}
+alerted_keys_lock   = threading.Lock()
+trades_history      = deque(maxlen=2000)
+trades_lock         = threading.Lock()
+near_signals        = {}
+near_signals_lock   = threading.Lock()
+near_signals_6      = {}
 near_signals_6_lock = threading.Lock()
-symbols_cache      = []
-symbols_cache_lock = threading.Lock()
-ohlcv_cache        = {}
-ohlcv_cache_lock   = threading.Lock()
+symbols_cache       = []
+symbols_cache_lock  = threading.Lock()
+ohlcv_cache         = {}
+ohlcv_cache_lock    = threading.Lock()
 
 fast_prefetch_done = threading.Event()
 prefetch_done      = threading.Event()
 
 diag_counts = {
-    "total"          : 0,
-    "no_data"        : 0,
-    "smi_oversold"   : 0,
-    "active_skip"    : 0,
-    "macd_red"       : 0,
-    "donchian_entry" : 0,
+    "total"           : 0,
+    "no_data"         : 0,
+    "smi_oversold"    : 0,
+    "active_skip"     : 0,
+    "macd_red"        : 0,
+    "donchian_entry"  : 0,
     "donchian_confirm": 0,
-    "macd_confirm"   : 0,
-    "ema50"          : 0,
-    "rsi_stoch"      : 0,
-    "passed"         : 0,
+    "macd_confirm"    : 0,
+    "ema50"           : 0,
+    "rsi_stoch"       : 0,
+    "passed"          : 0,
 }
-diag_lock = threading.Lock()
+diag_lock         = threading.Lock()
 cache_diag_logged = threading.Event()
-_local = threading.local()
+_local            = threading.local()
 
 # ──────────────────────────────────────────────
 # Helpers
@@ -121,7 +129,6 @@ def cleanup_alerted_keys():
         for k in expired: del alerted_keys[k]
 
 def cleanup_near6():
-    """حذف المحجوبات القديمة تلقائياً"""
     now = datetime.now(timezone.utc)
     with near_signals_6_lock:
         expired = [k for k, v in list(near_signals_6.items())
@@ -184,10 +191,10 @@ def _parse_klines(resp):
     return df.sort_values("ts").reset_index(drop=True)[["ts","open","high","low","close","vol"]]
 
 def get_ohlcv(symbol, tf, limit=500):
-    kc_sym  = to_kucoin_symbol(symbol)
-    kc_tf   = TF_MAP.get(tf, "1min")
-    end_sec = int(time.time())
-    tf_sec  = 60 if tf == "1m" else 3600
+    kc_sym    = to_kucoin_symbol(symbol)
+    kc_tf     = TF_MAP.get(tf, "1min")
+    end_sec   = int(time.time())
+    tf_sec    = 60 if tf == "1m" else 3600
     start_sec = end_sec - limit * tf_sec
     try:
         resp = get_session().get(
@@ -204,9 +211,9 @@ def get_ohlcv(symbol, tf, limit=500):
     return pd.DataFrame()
 
 def get_ohlcv_full(symbol, tf, target):
-    kc_sym  = to_kucoin_symbol(symbol)
-    kc_tf   = TF_MAP.get(tf, "1min")
-    tf_sec  = 60 if tf == "1m" else 3600
+    kc_sym     = to_kucoin_symbol(symbol)
+    kc_tf      = TF_MAP.get(tf, "1min")
+    tf_sec     = 60 if tf == "1m" else 3600
     KUCOIN_MAX = 1500
     all_dfs, end_sec, fetched, retries = [], int(time.time()), 0, 0
     while fetched < target:
@@ -352,7 +359,7 @@ def cache_updater_60m():
             if syms: _update_batch(syms, "60m", limit=5)
 
 # ──────────────────────────────────────────────
-# Resample
+# Resample — مطابق TradingView بـ EPOCH ثابت
 # ──────────────────────────────────────────────
 def resample_ohlcv(df, minutes):
     if df.empty or minutes <= 0: return pd.DataFrame()
@@ -361,30 +368,49 @@ def resample_ohlcv(df, minutes):
              .resample(f"{minutes}min", closed="left", label="left", origin=EPOCH)
              .agg({"open":"first","high":"max","low":"min","close":"last","vol":"sum"})
              .dropna())
+        # ✅ نحذف الشمعة الحية الأخيرة دائماً
         return r.iloc[:-1].reset_index()
     except Exception as e:
         log.error(f"resample error: {e}")
         return pd.DataFrame()
 
 # ──────────────────────────────────────────────
-# المؤشرات
+# ✅ المؤشرات — مطابقة TradingView + Warm-up كامل
 # ──────────────────────────────────────────────
+
+# ── Wilder's RMA (مطابق Pine Script 100%) ──────
+def wilder_rma(series, period):
+    """
+    rma(src, length) في Pine Script:
+    alpha = 1 / length
+    min_periods=period يضمن warm-up صحيح
+    """
+    return series.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
+
+# ── MACD ────────────────────────────────────────
+def _calc_macd_hist(close):
+    """
+    ✅ Warm-up: نحسب على كامل البيانات ثم نقرأ [-2]
+    Pine Script: macd = ema(src,12) - ema(src,26), signal = ema(macd,9)
+    """
+    ml   = close.ewm(span=12, min_periods=12, adjust=False).mean() \
+         - close.ewm(span=26, min_periods=26, adjust=False).mean()
+    sig  = ml.ewm(span=9, min_periods=9, adjust=False).mean()
+    return ml - sig
+
 def check_macd_green(df):
-    if len(df) < 35: return False
-    c   = df["close"]
-    ml  = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
-    sig = ml.ewm(span=9, adjust=False).mean()
-    return bool((ml - sig).iloc[-1] > 0)
+    if len(df) < WARMUP_MACD: return False
+    hist = _calc_macd_hist(df["close"])
+    return bool(hist.iloc[-2] > 0)
 
 def check_macd_red(df):
-    if len(df) < 35: return False
-    c   = df["close"]
-    ml  = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
-    sig = ml.ewm(span=9, adjust=False).mean()
-    return bool((ml - sig).iloc[-1] < 0)
+    if len(df) < WARMUP_MACD: return False
+    hist = _calc_macd_hist(df["close"])
+    return bool(hist.iloc[-2] < 0)
 
+# ── Donchian Ribbon ────────────────────────────
 def _dchannel_trend(closes, hh_prev, ll_prev):
-    n = len(closes)
+    n     = len(closes)
     trend = np.zeros(n, dtype=np.int8)
     for i in range(1, n):
         if np.isnan(hh_prev[i]) or np.isnan(ll_prev[i]):
@@ -398,15 +424,18 @@ def _dchannel_trend(closes, hh_prev, ll_prev):
     return trend
 
 def check_donchian_ribbon(df, length=20, direction="green"):
-    min_len = length + 2
-    if len(df) < min_len: return False
+    if len(df) < WARMUP_DON + length + 3: return False
     closes = df["close"].values
     highs  = df["high"].values
     lows   = df["low"].values
+
     def get_trend(ln):
-        hh = pd.Series(highs).rolling(ln).max().shift(1).values
-        ll = pd.Series(lows).rolling(ln).min().shift(1).values
-        return int(_dchannel_trend(closes, hh, ll)[-1])
+        hh = pd.Series(highs).rolling(ln, min_periods=ln).max().shift(1).values
+        ll = pd.Series(lows).rolling(ln, min_periods=ln).min().shift(1).values
+        tr = _dchannel_trend(closes, hh, ll)
+        # ✅ شمعة مغلقة [-2]
+        return int(tr[-2])
+
     main_trend = get_trend(length)
     sub_trends = [get_trend(l) for l in range(length - 1, max(length - 10, 4), -1)]
     if direction == "green":
@@ -414,77 +443,121 @@ def check_donchian_ribbon(df, length=20, direction="green"):
     else:
         return main_trend == -1 and sum(t == -1 for t in sub_trends) >= 5
 
+# ── EMA 50 ─────────────────────────────────────
 def check_ema50_below(df):
-    if len(df) < 50: return False
-    ema = df["close"].ewm(span=50, adjust=False).mean()
-    return bool(df["close"].iloc[-1] < ema.iloc[-1])
+    if len(df) < WARMUP_EMA: return False
+    # ✅ min_periods=50 + warm-up كامل + قراءة [-2]
+    ema = df["close"].ewm(span=50, min_periods=50, adjust=False).mean()
+    return bool(df["close"].iloc[-2] < ema.iloc[-2])
 
+# ── SMI ────────────────────────────────────────
 def calc_smi(high, low, close, k=10, d=3, ema_len=10, smooth=1):
-    hh    = high.rolling(k).max()
-    ll    = low.rolling(k).min()
+    """
+    ✅ min_periods مضاف لكل rolling/ewm
+    مطابق TradingView SMI Ergodic
+    """
+    hh    = high.rolling(k, min_periods=k).max()
+    ll    = low.rolling(k, min_periods=k).min()
     diff  = hh - ll
     rdiff = close - (hh + ll) / 2
 
-    avgrel  = rdiff.ewm(span=d, adjust=False).mean()
-    avgdiff = diff.ewm(span=d, adjust=False).mean()
+    avgrel  = rdiff.ewm(span=d, min_periods=d, adjust=False).mean()
+    avgdiff = diff.ewm(span=d, min_periods=d, adjust=False).mean()
 
     smi_arr = np.where(avgdiff != 0, (avgrel / (avgdiff / 2)) * 100, 0.0)
-    smi = pd.Series(smi_arr, index=close.index)
+    smi     = pd.Series(smi_arr, index=close.index)
 
     if smooth > 1:
-        smi = smi.rolling(smooth).mean()
+        smi = smi.rolling(smooth, min_periods=smooth).mean()
 
-    sig = smi.ewm(span=ema_len, adjust=False).mean()
+    sig = smi.ewm(span=ema_len, min_periods=ema_len, adjust=False).mean()
     return smi, sig
 
 def check_smi_oversold(df, threshold=-40):
-    if len(df) < 30: return False
+    if len(df) < WARMUP_SMI: return False
+    smi, _ = calc_smi(df["high"], df["low"], df["close"])
+    # ✅ شمعة مغلقة [-2]
+    return bool(smi.iloc[-2] <= threshold)
+
+def get_smi_value(df):
+    if len(df) < WARMUP_SMI: return None, None
     smi, sig = calc_smi(df["high"], df["low"], df["close"])
-    return bool(smi.iloc[-1] <= threshold)  # الخط الأسود (K) فقط
+    return round(float(smi.iloc[-2]), 2), round(float(sig.iloc[-2]), 2)
 
-def get_smi_value(df, threshold=-40):
-    """إرجاع قيمة SMI الحالية"""
-    if len(df) < 30: return None, None
-    smi, sig = calc_smi(df["high"], df["low"], df["close"])
-    return round(float(smi.iloc[-1]), 2), round(float(sig.iloc[-1]), 2)
-
-def wilder_rma(series, period):
-    return series.ewm(alpha=1/period, adjust=False).mean()
-
+# ── RSI (Wilder's — مطابق TradingView 100%) ────
 def calc_rsi_tv(close, period=14):
+    """
+    Pine Script:
+    up   = rma(max(change(src), 0), length)
+    down = rma(-min(change(src), 0), length)
+    rsi  = 100 - 100/(1 + up/down)
+    ✅ min_periods=period لضمان warm-up صحيح
+    """
     delta = close.diff()
     gain  = delta.clip(lower=0)
     loss  = (-delta.clip(upper=0))
-    return 100 - (100 / (1 + wilder_rma(gain, period) / (wilder_rma(loss, period) + 1e-10)))
+    up    = wilder_rma(gain, period)
+    down  = wilder_rma(loss, period)
+    return 100.0 - (100.0 / (1.0 + up / (down + 1e-10)))
 
+# ── Stochastic (SMA — مطابق TradingView) ───────
+def calc_stoch_tv(close, high, low, k_len=15, k_smooth=3, d_smooth=3):
+    """
+    Pine Script:
+    k = sma(stoch(close,high,low,length), smoothK)
+    d = sma(k, smoothD)
+    ✅ SMA وليس EMA + min_periods
+    """
+    lo  = low.rolling(k_len, min_periods=k_len).min()
+    hi  = high.rolling(k_len, min_periods=k_len).max()
+    raw = 100.0 * (close - lo) / (hi - lo + 1e-10)
+    k   = raw.rolling(k_smooth, min_periods=k_smooth).mean()
+    d   = k.rolling(d_smooth, min_periods=d_smooth).mean()
+    return k, d
+
+# ── check_rsi_stoch ─────────────────────────────
 def check_rsi_stoch(df, lookback=10):
-    if len(df) < 50: return False
-    close, high, low = df["close"], df["high"], df["low"]
+    """
+    ✅ كل الفحوصات على شموع مغلقة فقط range(-lookback, -1)
+    ✅ RSI بـ Wilder's RMA الصحيح
+    ✅ Stochastic بـ SMA مطابق TradingView
+    ✅ Warm-up كافٍ قبل القراءة
+    """
+    if len(df) < WARMUP_RSI: return False
 
+    close = df["close"]
+    high  = df["high"]
+    low   = df["low"]
+
+    # ── RSI ──
     rsi    = calc_rsi_tv(close, period=14)
-    rsi_ma = rsi.rolling(14).mean()
-    if rsi.iloc[-20:].min() > 35: return False
+    rsi_ma = rsi.rolling(14, min_periods=14).mean()
 
+    # فحص على شموع مغلقة فقط [-20:-1]
+    if rsi.iloc[-20:-1].min() > 35:
+        return False
+
+    # تقاطع RSI فوق MA — شموع مغلقة فقط
     rsi_cross = any(
         rsi.iloc[i-1] < rsi_ma.iloc[i-1] and rsi.iloc[i] >= rsi_ma.iloc[i]
-        for i in range(-lookback, 0)
+        for i in range(-lookback, -1)
     )
-    if not rsi_cross: return False
+    if not rsi_cross:
+        return False
 
-    lo15  = low.rolling(15).min()
-    hi15  = high.rolling(15).max()
-    k_raw = 100 * (close - lo15) / (hi15 - lo15 + 1e-10)
-    k     = k_raw.rolling(3).mean()
-    d     = k.rolling(3).mean()
+    # ── Stochastic ──
+    k, d = calc_stoch_tv(close, high, low, k_len=15, k_smooth=3, d_smooth=3)
 
+    # تقاطع K فوق 20 — شموع مغلقة فقط
     cross_20 = any(
         k.iloc[i-1] <= 20 and k.iloc[i] > 20
-        for i in range(-lookback, 0)
+        for i in range(-lookback, -1)
     )
 
+    # تقاطع K فوق D — شموع مغلقة فقط
     cross_d = any(
         k.iloc[i-1] <= d.iloc[i-1] and k.iloc[i] > d.iloc[i]
-        for i in range(-lookback, 0)
+        for i in range(-lookback, -1)
     )
 
     return rsi_cross and cross_20 and cross_d
@@ -575,64 +648,65 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
     df_confirm = resample_ohlcv(raw_ec, confirm_min)
     df_third   = resample_ohlcv(raw_t,  third_min)
 
-    if any(d.empty or len(d) < 25 for d in [df_entry, df_confirm, df_third]):
+    # ✅ نتحقق من وجود شموع كافية للـ warm-up
+    if any(d.empty or len(d) < MIN_CANDLES for d in [df_entry, df_confirm, df_third]):
         with diag_lock: diag_counts["no_data"] += 1
         return
 
-    # ① تشبع بيعي SMI
+    # ① SMI تشبع بيعي
     if not check_smi_oversold(df_entry):
         with diag_lock: diag_counts["smi_oversold"] += 1
         return
 
-    # ⭐ active_skip — لو الفريم الأكبر في تشبع بيعي → ألغِ نهائياً
+    # ⭐ active_skip
     next_tf = NEXT_TF.get(entry_min)
     if next_tf is not None:
         df_next = resample_ohlcv(raw_ec, next_tf)
-        if not df_next.empty and len(df_next) >= 25:
+        if not df_next.empty and len(df_next) >= MIN_CANDLES:
             if check_smi_oversold(df_next):
-                # احفظ في near_signals_6 مع قيمة SMI للفريم الأكبر
                 smi_val, sig_val = get_smi_value(df_next)
                 with near_signals_6_lock:
                     near_signals_6[near_key] = {
-                        "time"      : datetime.now(timezone.utc),
-                        "symbol"    : symbol,
-                        "price"     : df_entry["close"].iloc[-1],
-                        "tf"        : f"{entry_min}m/{confirm_min}m/{third_min}m",
-                        "next_tf"   : next_tf,
-                        "smi_next"  : smi_val,
-                        "sig_next"  : sig_val,
-                        "stage"     : f"محجوبة — الفريم {next_tf}m في تشبع بيعي",
+                        "time"    : datetime.now(timezone.utc),
+                        "symbol"  : symbol,
+                        "price"   : df_entry["close"].iloc[-2],
+                        "tf"      : f"{entry_min}m/{confirm_min}m/{third_min}m",
+                        "next_tf" : next_tf,
+                        "smi_next": smi_val,
+                        "sig_next": sig_val,
+                        "stage"   : f"محجوبة — الفريم {next_tf}m في تشبع بيعي",
                     }
                 with diag_lock: diag_counts["active_skip"] += 1
                 return
 
-    # إذا وصلت هنا = الفريم الأكبر لا يمنعها → احذفها من near_signals_6 لو كانت محفوظة
     with near_signals_6_lock:
         near_signals_6.pop(near_key, None)
 
+    # ③ MACD أحمر
     if not check_macd_red(df_entry):
         with diag_lock: diag_counts["macd_red"] += 1
         return
 
+    # ④ Donchian Entry أخضر
     if not check_donchian_ribbon(df_entry, direction="green"):
         with diag_lock: diag_counts["donchian_entry"] += 1
         return
 
+    # ⑤ Donchian Confirm أخضر
     if not check_donchian_ribbon(df_confirm, direction="green"):
         with diag_lock: diag_counts["donchian_confirm"] += 1
         return
 
-    # ⑥ MACD Confirm — تنبيه مبكر
+    # ⑥ MACD Confirm أخضر — تنبيه مبكر
     if not check_macd_green(df_confirm):
         with diag_lock: diag_counts["macd_confirm"] += 1
         return
 
-    # اجتاز 6 شروط — تنبيه مبكر
     early_key = f"EARLY_{near_key}"
     with alerted_keys_lock:
         if early_key not in alerted_keys:
             alerted_keys[early_key] = datetime.now(timezone.utc)
-            price = df_entry["close"].iloc[-1]
+            price = df_entry["close"].iloc[-2]
             send_telegram(
                 f"⏳ <b>تنبيه مبكر — شرط 6/8</b>\n"
                 f"🪙 <b>{symbol}</b>\n"
@@ -641,6 +715,7 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
                 f"⚠️ باقي: EMA50 + RSI/Stoch"
             )
 
+    # ⑦ EMA50
     if not check_ema50_below(df_entry):
         with diag_lock: diag_counts["ema50"] += 1
         return
@@ -648,7 +723,7 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
     # ⑧ RSI/Stoch
     if not check_rsi_stoch(df_third):
         with diag_lock: diag_counts["rsi_stoch"] += 1
-        price = df_entry["close"].iloc[-1]
+        price = df_entry["close"].iloc[-2]
         with near_signals_lock:
             near_signals[near_key] = {
                 "time"  : datetime.now(timezone.utc),
@@ -666,16 +741,16 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
 
     with diag_lock: diag_counts["passed"] += 1
 
-    last_ts = df_entry["ts"].iloc[-1].strftime("%Y%m%d%H%M") if "ts" in df_entry.columns else "x"
+    last_ts = df_entry["ts"].iloc[-2].strftime("%Y%m%d%H%M") if "ts" in df_entry.columns else "x"
     key = f"{symbol}_{entry_min}_{last_ts}"
 
     with alerted_keys_lock:
         if key in alerted_keys: return
         alerted_keys[key] = datetime.now(timezone.utc)
 
-    price       = df_entry["close"].iloc[-1]
+    price       = df_entry["close"].iloc[-2]
     now_utc     = datetime.now(timezone.utc)
-    candle_time = df_entry["ts"].iloc[-1].strftime("%Y-%m-%d %H:%M UTC")
+    candle_time = df_entry["ts"].iloc[-2].strftime("%Y-%m-%d %H:%M UTC")
     signal_time = now_utc.strftime("%Y-%m-%d %H:%M UTC")
 
     save_signal(symbol, price, entry_min, confirm_min, third_min)
@@ -747,13 +822,10 @@ def poll_telegram_commands():
                         "⚠️ لا توجد بيانات." if diag_counts["total"] == 0
                         else build_diag_msg(reset=False), chat_id
                     )
-
                 elif txt == "/top6":
-                    # العملات اللي وصلت شرط 7/8 (باقي RSI/Stoch فقط)
                     now = datetime.now(timezone.utc)
                     with near_signals_lock:
                         rows8 = list(near_signals.values())
-
                     if not rows8:
                         send_telegram("⏳ لا توجد عملات قريبة من الإشارة (7/8).", chat_id)
                     else:
@@ -765,16 +837,13 @@ def poll_telegram_commands():
                                 f"{row['price']:.6g} | منذ {age} دقيقة"
                             )
                         send_telegram("\n".join(lines), chat_id)
-
                 elif txt == "/blocked":
-                    # العملات المحجوبة بالفريم الأكبر — آخر ساعتين فقط
                     now = datetime.now(timezone.utc)
                     with near_signals_6_lock:
                         rows6 = [
                             v for v in near_signals_6.values()
                             if now - v["time"] <= timedelta(hours=NEAR6_EXPIRY_HOURS)
                         ]
-
                     if not rows6:
                         send_telegram(
                             f"⏳ لا توجد عملات محجوبة خلال آخر {NEAR6_EXPIRY_HOURS} ساعات.",
@@ -796,12 +865,11 @@ def poll_telegram_commands():
                                 f"{row['price']:.6g}{smi_txt} | منذ {age} دقيقة"
                             )
                         send_telegram("\n".join(lines), chat_id)
-
                 elif txt == "/status":
-                    with trades_lock:       cnt    = len(trades_history)
-                    with alerted_keys_lock: active = len(alerted_keys)
-                    with ohlcv_cache_lock:  keys   = len(ohlcv_cache)
-                    with near_signals_lock: near   = len(near_signals)
+                    with trades_lock:        cnt   = len(trades_history)
+                    with alerted_keys_lock:  active = len(alerted_keys)
+                    with ohlcv_cache_lock:   keys  = len(ohlcv_cache)
+                    with near_signals_lock:  near  = len(near_signals)
                     with near_signals_6_lock: near6 = len(near_signals_6)
                     send_telegram(
                         f"🤖 البوت يعمل — KuCoin API\n"
@@ -817,7 +885,7 @@ def poll_telegram_commands():
                     )
                 elif txt == "/cache":
                     with ohlcv_cache_lock:
-                        sample = list(ohlcv_cache.items())[:5]
+                        sample     = list(ohlcv_cache.items())[:5]
                         total_keys = len(ohlcv_cache)
                     lines = [f"🔬 <b>الكاش ({total_keys} مفتاح):</b>"]
                     for (sym, tf), df in sample:
@@ -914,7 +982,7 @@ class HealthHandler(BaseHTTPRequestHandler):
 # Main
 # ──────────────────────────────────────────────
 def main():
-    log.info("🚀 Tripling Strategy Bot — KuCoin API")
+    log.info("🚀 Tripling Strategy Bot — KuCoin API (TV-Match v2)")
     delete_webhook()
     threading.Thread(target=update_symbols_loop, daemon=True).start()
     while not symbols_cache: time.sleep(1)
