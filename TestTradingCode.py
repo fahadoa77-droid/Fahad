@@ -48,16 +48,13 @@ API_FETCH_CANDLES  = {"1m": 15_000, "60m": 2_000}
 CACHE_MAX_CANDLES  = {"1m": 16_000, "60m": 2_500}
 EPOCH = pd.Timestamp("1970-01-01", tz="UTC")
 
-# ── Warm-up: عدد الشموع الكافي لكل مؤشر قبل القراءة ──
-# TradingView يحسب EWM من أول شمعة تاريخية
-# كلما زاد الـ warm-up كلما اقتربنا من قيمة TradingView
-WARMUP_EMA   = 200   # EMA 50 تحتاج 200 شمعة warm-up
-WARMUP_MACD  = 200   # MACD 26+9 تحتاج 200 شمعة
-WARMUP_SMI   = 100   # SMI تحتاج 100 شمعة
-WARMUP_RSI   = 200   # RSI 14 تحتاج 200 شمعة
-WARMUP_STOCH = 100   # Stochastic تحتاج 100 شمعة
-WARMUP_DON   = 50    # Donchian تحتاج 50 شمعة
-MIN_CANDLES  = 250   # الحد الأدنى للشموع في أي dataframe للفحص
+WARMUP_EMA   = 200
+WARMUP_MACD  = 200
+WARMUP_SMI   = 100
+WARMUP_RSI   = 200
+WARMUP_STOCH = 100
+WARMUP_DON   = 50
+MIN_CANDLES  = 250
 
 alerted_keys        = {}
 alerted_keys_lock   = threading.Lock()
@@ -359,7 +356,7 @@ def cache_updater_60m():
             if syms: _update_batch(syms, "60m", limit=5)
 
 # ──────────────────────────────────────────────
-# Resample — مطابق TradingView بـ EPOCH ثابت
+# Resample
 # ──────────────────────────────────────────────
 def resample_ohlcv(df, minutes):
     if df.empty or minutes <= 0: return pd.DataFrame()
@@ -375,38 +372,27 @@ def resample_ohlcv(df, minutes):
         return pd.DataFrame()
 
 # ──────────────────────────────────────────────
-# ✅ المؤشرات — مطابقة TradingView + Warm-up كامل
+# المؤشرات — مطابقة TradingView 100%
 # ──────────────────────────────────────────────
 
-# ── Wilder's RMA (مطابق Pine Script 100%) ──────
+# ── Wilder's RMA ───────────────────────────────
 def wilder_rma(series, period):
-    """
-    rma(src, length) في Pine Script:
-    alpha = 1 / length
-    min_periods=period يضمن warm-up صحيح
-    """
     return series.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
 
-# ── MACD ────────────────────────────────────────
+# ── MACD ───────────────────────────────────────
 def _calc_macd_hist(close):
-    """
-    ✅ Warm-up: نحسب على كامل البيانات ثم نقرأ [-2]
-    Pine Script: macd = ema(src,12) - ema(src,26), signal = ema(macd,9)
-    """
-    ml   = close.ewm(span=12, min_periods=12, adjust=False).mean() \
-         - close.ewm(span=26, min_periods=26, adjust=False).mean()
-    sig  = ml.ewm(span=9, min_periods=9, adjust=False).mean()
+    ml  = close.ewm(span=12, min_periods=12, adjust=False).mean() \
+        - close.ewm(span=26, min_periods=26, adjust=False).mean()
+    sig = ml.ewm(span=9, min_periods=9, adjust=False).mean()
     return ml - sig
 
 def check_macd_green(df):
     if len(df) < WARMUP_MACD: return False
-    hist = _calc_macd_hist(df["close"])
-    return bool(hist.iloc[-2] > 0)
+    return bool(_calc_macd_hist(df["close"]).iloc[-2] > 0)
 
 def check_macd_red(df):
     if len(df) < WARMUP_MACD: return False
-    hist = _calc_macd_hist(df["close"])
-    return bool(hist.iloc[-2] < 0)
+    return bool(_calc_macd_hist(df["close"]).iloc[-2] < 0)
 
 # ── Donchian Ribbon ────────────────────────────
 def _dchannel_trend(closes, hh_prev, ll_prev):
@@ -432,9 +418,7 @@ def check_donchian_ribbon(df, length=20, direction="green"):
     def get_trend(ln):
         hh = pd.Series(highs).rolling(ln, min_periods=ln).max().shift(1).values
         ll = pd.Series(lows).rolling(ln, min_periods=ln).min().shift(1).values
-        tr = _dchannel_trend(closes, hh, ll)
-        # ✅ شمعة مغلقة [-2]
-        return int(tr[-2])
+        return int(_dchannel_trend(closes, hh, ll)[-2])
 
     main_trend = get_trend(length)
     sub_trends = [get_trend(l) for l in range(length - 1, max(length - 10, 4), -1)]
@@ -446,23 +430,27 @@ def check_donchian_ribbon(df, length=20, direction="green"):
 # ── EMA 50 ─────────────────────────────────────
 def check_ema50_below(df):
     if len(df) < WARMUP_EMA: return False
-    # ✅ min_periods=50 + warm-up كامل + قراءة [-2]
     ema = df["close"].ewm(span=50, min_periods=50, adjust=False).mean()
     return bool(df["close"].iloc[-2] < ema.iloc[-2])
 
-# ── SMI ────────────────────────────────────────
+# ── SMI — مطابق TradingView بـ EMA مزدوج ✅ ────
 def calc_smi(high, low, close, k=10, d=3, ema_len=10, smooth=1):
     """
-    ✅ min_periods مضاف لكل rolling/ewm
-    مطابق TradingView SMI Ergodic
+    ✅ TradingView SMI Ergodic يطبق EMA مزدوج (EMA of EMA):
+        avgrel  = ema(ema(rdiff, d), d)
+        avgdiff = ema(ema(diff,  d), d)
+    هذا يعطي نتيجة مطابقة 100% لـ TradingView
     """
     hh    = high.rolling(k, min_periods=k).max()
     ll    = low.rolling(k, min_periods=k).min()
     diff  = hh - ll
     rdiff = close - (hh + ll) / 2
 
-    avgrel  = rdiff.ewm(span=d, min_periods=d, adjust=False).mean()
-    avgdiff = diff.ewm(span=d, min_periods=d, adjust=False).mean()
+    # ✅ EMA مزدوج — الإصلاح الرئيسي
+    avgrel  = rdiff.ewm(span=d, min_periods=d, adjust=False).mean() \
+                   .ewm(span=d, min_periods=d, adjust=False).mean()
+    avgdiff = diff.ewm(span=d, min_periods=d, adjust=False).mean() \
+                  .ewm(span=d, min_periods=d, adjust=False).mean()
 
     smi_arr = np.where(avgdiff != 0, (avgrel / (avgdiff / 2)) * 100, 0.0)
     smi     = pd.Series(smi_arr, index=close.index)
@@ -476,7 +464,6 @@ def calc_smi(high, low, close, k=10, d=3, ema_len=10, smooth=1):
 def check_smi_oversold(df, threshold=-40):
     if len(df) < WARMUP_SMI: return False
     smi, _ = calc_smi(df["high"], df["low"], df["close"])
-    # ✅ شمعة مغلقة [-2]
     return bool(smi.iloc[-2] <= threshold)
 
 def get_smi_value(df):
@@ -484,15 +471,8 @@ def get_smi_value(df):
     smi, sig = calc_smi(df["high"], df["low"], df["close"])
     return round(float(smi.iloc[-2]), 2), round(float(sig.iloc[-2]), 2)
 
-# ── RSI (Wilder's — مطابق TradingView 100%) ────
+# ── RSI ────────────────────────────────────────
 def calc_rsi_tv(close, period=14):
-    """
-    Pine Script:
-    up   = rma(max(change(src), 0), length)
-    down = rma(-min(change(src), 0), length)
-    rsi  = 100 - 100/(1 + up/down)
-    ✅ min_periods=period لضمان warm-up صحيح
-    """
     delta = close.diff()
     gain  = delta.clip(lower=0)
     loss  = (-delta.clip(upper=0))
@@ -502,12 +482,6 @@ def calc_rsi_tv(close, period=14):
 
 # ── Stochastic (SMA — مطابق TradingView) ───────
 def calc_stoch_tv(close, high, low, k_len=15, k_smooth=3, d_smooth=3):
-    """
-    Pine Script:
-    k = sma(stoch(close,high,low,length), smoothK)
-    d = sma(k, smoothD)
-    ✅ SMA وليس EMA + min_periods
-    """
     lo  = low.rolling(k_len, min_periods=k_len).min()
     hi  = high.rolling(k_len, min_periods=k_len).max()
     raw = 100.0 * (close - lo) / (hi - lo + 1e-10)
@@ -515,29 +489,20 @@ def calc_stoch_tv(close, high, low, k_len=15, k_smooth=3, d_smooth=3):
     d   = k.rolling(d_smooth, min_periods=d_smooth).mean()
     return k, d
 
-# ── check_rsi_stoch ─────────────────────────────
+# ── RSI + Stochastic ───────────────────────────
 def check_rsi_stoch(df, lookback=10):
-    """
-    ✅ كل الفحوصات على شموع مغلقة فقط range(-lookback, -1)
-    ✅ RSI بـ Wilder's RMA الصحيح
-    ✅ Stochastic بـ SMA مطابق TradingView
-    ✅ Warm-up كافٍ قبل القراءة
-    """
     if len(df) < WARMUP_RSI: return False
 
     close = df["close"]
     high  = df["high"]
     low   = df["low"]
 
-    # ── RSI ──
     rsi    = calc_rsi_tv(close, period=14)
     rsi_ma = rsi.rolling(14, min_periods=14).mean()
 
-    # فحص على شموع مغلقة فقط [-20:-1]
     if rsi.iloc[-20:-1].min() > 35:
         return False
 
-    # تقاطع RSI فوق MA — شموع مغلقة فقط
     rsi_cross = any(
         rsi.iloc[i-1] < rsi_ma.iloc[i-1] and rsi.iloc[i] >= rsi_ma.iloc[i]
         for i in range(-lookback, -1)
@@ -545,16 +510,13 @@ def check_rsi_stoch(df, lookback=10):
     if not rsi_cross:
         return False
 
-    # ── Stochastic ──
     k, d = calc_stoch_tv(close, high, low, k_len=15, k_smooth=3, d_smooth=3)
 
-    # تقاطع K فوق 20 — شموع مغلقة فقط
     cross_20 = any(
         k.iloc[i-1] <= 20 and k.iloc[i] > 20
         for i in range(-lookback, -1)
     )
 
-    # تقاطع K فوق D — شموع مغلقة فقط
     cross_d = any(
         k.iloc[i-1] <= d.iloc[i-1] and k.iloc[i] > d.iloc[i]
         for i in range(-lookback, -1)
@@ -648,7 +610,6 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
     df_confirm = resample_ohlcv(raw_ec, confirm_min)
     df_third   = resample_ohlcv(raw_t,  third_min)
 
-    # ✅ نتحقق من وجود شموع كافية للـ warm-up
     if any(d.empty or len(d) < MIN_CANDLES for d in [df_entry, df_confirm, df_third]):
         with diag_lock: diag_counts["no_data"] += 1
         return
@@ -872,7 +833,7 @@ def poll_telegram_commands():
                     with near_signals_lock:  near  = len(near_signals)
                     with near_signals_6_lock: near6 = len(near_signals_6)
                     send_telegram(
-                        f"🤖 البوت يعمل — KuCoin API\n"
+                        f"🤖 البوت يعمل — KuCoin API (TV-Match v3)\n"
                         f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
                         f"📊 إجمالي الإشارات: {cnt}\n"
                         f"🔴 قريبة من الإشارة (7/8): {near}\n"
@@ -982,7 +943,7 @@ class HealthHandler(BaseHTTPRequestHandler):
 # Main
 # ──────────────────────────────────────────────
 def main():
-    log.info("🚀 Tripling Strategy Bot — KuCoin API (TV-Match v2)")
+    log.info("🚀 Tripling Strategy Bot — KuCoin API (TV-Match v3)")
     delete_webhook()
     threading.Thread(target=update_symbols_loop, daemon=True).start()
     while not symbols_cache: time.sleep(1)
