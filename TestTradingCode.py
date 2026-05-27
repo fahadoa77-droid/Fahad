@@ -372,7 +372,7 @@ def resample_ohlcv(df, minutes):
         return pd.DataFrame()
 
 # ──────────────────────────────────────────────
-# المؤشرات — مطابقة TradingView 100%
+# المؤشرات
 # ──────────────────────────────────────────────
 
 # ── Wilder's RMA ───────────────────────────────
@@ -394,15 +394,7 @@ def check_macd_red(df):
     if len(df) < WARMUP_MACD: return False
     return bool(_calc_macd_hist(df["close"]).iloc[-2] < 0)
 
-# ──────────────────────────────────────────────
-# ✅ Donchian Ribbon — مطابق TradingView 100%
-#
-# الكود الأصلي (Pine Script):
-#   dchannel(len)    → يحسب trend الرئيسي بـ dlen=20
-#   dchannelalt(len) → يحسب trend كل طبقة من dlen-0 إلى dlen-9
-#   الشرط الحقيقي: maintrend==1 AND كل subtrend==1
-#   (اللون الأخضر الغامق = main وsub كلاهما 1)
-# ──────────────────────────────────────────────
+# ── Donchian Ribbon ────────────────────────────
 def _dchannel_trend(closes, hh_prev, ll_prev):
     n     = len(closes)
     trend = np.zeros(n, dtype=np.int8)
@@ -418,15 +410,6 @@ def _dchannel_trend(closes, hh_prev, ll_prev):
     return trend
 
 def check_donchian_ribbon(df, length=20, direction="green"):
-    """
-    ✅ مطابق 100% لـ TradingView Donchian Trend Ribbon
-    
-    Pine Script الأصلي يرسم 10 طبقات: dlen-0 إلى dlen-9
-    كل طبقة تقارن trend الخاص بها مع maintrend
-    اللون الغامق (إشارة قوية) = maintrend == subtrend
-    
-    الشرط هنا: maintrend + كل subtrends في نفس الاتجاه (all)
-    """
     if len(df) < WARMUP_DON + length + 3:
         return False
 
@@ -439,60 +422,37 @@ def check_donchian_ribbon(df, length=20, direction="green"):
         ll = pd.Series(lows).rolling(ln, min_periods=ln).min().shift(1).values
         return int(_dchannel_trend(closes, hh, ll)[-2])
 
-    # ✅ الرئيسي مستقل تماماً مثل dchannel(dlen) في Pine Script
     main_trend = get_trend(length)
-
-    # ✅ 10 طبقات فرعية: dlen-0, dlen-1, ..., dlen-9
-    # مطابق لـ: dchannelalt(dlen-0) إلى dchannelalt(dlen-9)
     sub_trends = [get_trend(length - i) for i in range(10)]
 
     if direction == "green":
-        # ✅ الرئيسي أخضر + كل الطبقات العشر خضراء = كلها غامقة في TradingView
         return main_trend == 1 and all(t == 1 for t in sub_trends)
     else:
-        # ✅ الرئيسي أحمر + كل الطبقات العشر حمراء
         return main_trend == -1 and all(t == -1 for t in sub_trends)
 
 # ── EMA 50 ─────────────────────────────────────
 def check_ema50_below(df):
-    """
-    ✅ إصلاح EMA 50:
-    1. هامش واضح 0.1% — ليس مجرد لمسة
-    2. اتجاه EMA نازل أو مسطح — يمنع الإشارات الوهمية
-    3. WARMUP معقول 100 بدل 200 الزائدة
-    """
     if len(df) < 100: return False
 
     ema   = df["close"].ewm(span=50, min_periods=50, adjust=False).mean()
     price = df["close"].iloc[-2]
     ema_val = ema.iloc[-2]
 
-    # ✅ السعر تحت EMA بهامش 0.1% على الأقل
-    price_below = price < ema_val * 0.999
-
-    # ✅ EMA نازلة أو مسطحة (نقارن آخر شمعة مع 5 شموع قبلها)
+    price_below   = price < ema_val * 0.999
     ema_direction = ema.iloc[-2] <= ema.iloc[-6]
 
     return price_below and ema_direction
 
-# ── SMI — مطابق TradingView بـ EMA مزدوج ✅ ────
+# ── SMI — ✅ مطابق TradingView (EMA مرة وحدة) ──
 def calc_smi(high, low, close, k=10, d=3, ema_len=10, smooth=1):
-    """
-    ✅ TradingView SMI Ergodic يطبق EMA مزدوج (EMA of EMA):
-        avgrel  = ema(ema(rdiff, d), d)
-        avgdiff = ema(ema(diff,  d), d)
-    هذا يعطي نتيجة مطابقة 100% لـ TradingView
-    """
     hh    = high.rolling(k, min_periods=k).max()
     ll    = low.rolling(k, min_periods=k).min()
     diff  = hh - ll
     rdiff = close - (hh + ll) / 2
 
-    # ✅ EMA مزدوج — الإصلاح الرئيسي
-    avgrel  = rdiff.ewm(span=d, min_periods=d, adjust=False).mean() \
-                   .ewm(span=d, min_periods=d, adjust=False).mean()
-    avgdiff = diff.ewm(span=d, min_periods=d, adjust=False).mean() \
-                  .ewm(span=d, min_periods=d, adjust=False).mean()
+    # ✅ EMA مرة وحدة — مطابق TradingView
+    avgrel  = rdiff.ewm(span=d, min_periods=d, adjust=False).mean()
+    avgdiff = diff.ewm(span=d, min_periods=d, adjust=False).mean()
 
     smi_arr = np.where(avgdiff != 0, (avgrel / (avgdiff / 2)) * 100, 0.0)
     smi     = pd.Series(smi_arr, index=close.index)
@@ -522,7 +482,7 @@ def calc_rsi_tv(close, period=14):
     down  = wilder_rma(loss, period)
     return 100.0 - (100.0 / (1.0 + up / (down + 1e-10)))
 
-# ── Stochastic (SMA — مطابق TradingView) ───────
+# ── Stochastic ─────────────────────────────────
 def calc_stoch_tv(close, high, low, k_len=15, k_smooth=3, d_smooth=3):
     lo  = low.rolling(k_len, min_periods=k_len).min()
     hi  = high.rolling(k_len, min_periods=k_len).max()
@@ -690,12 +650,12 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
         with diag_lock: diag_counts["macd_red"] += 1
         return
 
-    # ④ Donchian Entry أخضر — ✅ مطابق TradingView بعد التعديل
+    # ④ Donchian Entry أخضر
     if not check_donchian_ribbon(df_entry, direction="green"):
         with diag_lock: diag_counts["donchian_entry"] += 1
         return
 
-    # ⑤ Donchian Confirm أخضر — ✅ مطابق TradingView بعد التعديل
+    # ⑤ Donchian Confirm أخضر
     if not check_donchian_ribbon(df_confirm, direction="green"):
         with diag_lock: diag_counts["donchian_confirm"] += 1
         return
@@ -875,7 +835,7 @@ def poll_telegram_commands():
                     with near_signals_lock:  near  = len(near_signals)
                     with near_signals_6_lock: near6 = len(near_signals_6)
                     send_telegram(
-                        f"🤖 البوت يعمل — KuCoin API (TV-Match v4 ✅)\n"
+                        f"🤖 البوت يعمل — KuCoin API (TV-Match v5 ✅)\n"
                         f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
                         f"📊 إجمالي الإشارات: {cnt}\n"
                         f"🔴 قريبة من الإشارة (7/8): {near}\n"
@@ -985,7 +945,7 @@ class HealthHandler(BaseHTTPRequestHandler):
 # Main
 # ──────────────────────────────────────────────
 def main():
-    log.info("🚀 Tripling Strategy Bot — KuCoin API (TV-Match v4 ✅ Donchian Fixed)")
+    log.info("🚀 Tripling Strategy Bot — KuCoin API (TV-Match v5 ✅ SMI Fixed)")
     delete_webhook()
     threading.Thread(target=update_symbols_loop, daemon=True).start()
     while not symbols_cache: time.sleep(1)
