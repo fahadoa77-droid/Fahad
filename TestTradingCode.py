@@ -48,16 +48,13 @@ API_FETCH_CANDLES  = {"1m": 15_000, "60m": 2_000}
 CACHE_MAX_CANDLES  = {"1m": 16_000, "60m": 2_500}
 EPOCH = pd.Timestamp("1970-01-01", tz="UTC")
 
-# ── Warm-up: عدد الشموع الكافي لكل مؤشر قبل القراءة ──
-# TradingView يحسب EWM من أول شمعة تاريخية
-# كلما زاد الـ warm-up كلما اقتربنا من قيمة TradingView
-WARMUP_EMA   = 200   # EMA 50 تحتاج 200 شمعة warm-up
-WARMUP_MACD  = 200   # MACD 26+9 تحتاج 200 شمعة
-WARMUP_SMI   = 100   # SMI تحتاج 100 شمعة
-WARMUP_RSI   = 200   # RSI 14 تحتاج 200 شمعة
-WARMUP_STOCH = 100   # Stochastic تحتاج 100 شمعة
-WARMUP_DON   = 50    # Donchian تحتاج 50 شمعة
-MIN_CANDLES  = 250   # الحد الأدنى للشموع في أي dataframe للفحص
+WARMUP_EMA   = 200
+WARMUP_MACD  = 200
+WARMUP_SMI   = 100
+WARMUP_RSI   = 200
+WARMUP_STOCH = 100
+WARMUP_DON   = 50
+MIN_CANDLES  = 250
 
 alerted_keys        = {}
 alerted_keys_lock   = threading.Lock()
@@ -359,7 +356,7 @@ def cache_updater_60m():
             if syms: _update_batch(syms, "60m", limit=5)
 
 # ──────────────────────────────────────────────
-# Resample — مطابق TradingView بـ EPOCH ثابت
+# Resample
 # ──────────────────────────────────────────────
 def resample_ohlcv(df, minutes):
     if df.empty or minutes <= 0: return pd.DataFrame()
@@ -368,35 +365,29 @@ def resample_ohlcv(df, minutes):
              .resample(f"{minutes}min", closed="left", label="left", origin=EPOCH)
              .agg({"open":"first","high":"max","low":"min","close":"last","vol":"sum"})
              .dropna())
-        # ✅ نحذف الشمعة الحية الأخيرة دائماً
         return r.iloc[:-1].reset_index()
     except Exception as e:
         log.error(f"resample error: {e}")
         return pd.DataFrame()
 
 # ──────────────────────────────────────────────
-# ✅ المؤشرات — مطابقة TradingView + Warm-up كامل
+# Indicators
 # ──────────────────────────────────────────────
-
-# ── Wilder's RMA (مطابق Pine Script 100%) ──────
 def wilder_rma(series, period):
-    """
-    rma(src, length) في Pine Script:
-    alpha = 1 / length
-    min_periods=period يضمن warm-up صحيح
-    """
     return series.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
 
-# ── MACD ────────────────────────────────────────
 def _calc_macd_hist(close):
-    """
-    ✅ Warm-up: نحسب على كامل البيانات ثم نقرأ [-2]
-    Pine Script: macd = ema(src,12) - ema(src,26), signal = ema(macd,9)
-    """
-    ml   = close.ewm(span=12, min_periods=12, adjust=False).mean() \
-         - close.ewm(span=26, min_periods=26, adjust=False).mean()
-    sig  = ml.ewm(span=9, min_periods=9, adjust=False).mean()
+    ml  = close.ewm(span=12, min_periods=12, adjust=False).mean() \
+        - close.ewm(span=26, min_periods=26, adjust=False).mean()
+    sig = ml.ewm(span=9, min_periods=9, adjust=False).mean()
     return ml - sig
+
+def _calc_macd_full(close):
+    macd_line   = close.ewm(span=12, min_periods=12, adjust=False).mean() \
+                - close.ewm(span=26, min_periods=26, adjust=False).mean()
+    signal_line = macd_line.ewm(span=9, min_periods=9, adjust=False).mean()
+    histogram   = macd_line - signal_line
+    return macd_line, signal_line, histogram
 
 def check_macd_green(df):
     if len(df) < WARMUP_MACD: return False
@@ -408,7 +399,6 @@ def check_macd_red(df):
     hist = _calc_macd_hist(df["close"])
     return bool(hist.iloc[-2] < 0)
 
-# ── Donchian Ribbon ────────────────────────────
 def _dchannel_trend(closes, hh_prev, ll_prev):
     n     = len(closes)
     trend = np.zeros(n, dtype=np.int8)
@@ -433,7 +423,6 @@ def check_donchian_ribbon(df, length=20, direction="green"):
         hh = pd.Series(highs).rolling(ln, min_periods=ln).max().shift(1).values
         ll = pd.Series(lows).rolling(ln, min_periods=ln).min().shift(1).values
         tr = _dchannel_trend(closes, hh, ll)
-        # ✅ شمعة مغلقة [-2]
         return int(tr[-2])
 
     main_trend = get_trend(length)
@@ -443,40 +432,28 @@ def check_donchian_ribbon(df, length=20, direction="green"):
     else:
         return main_trend == -1 and sum(t == -1 for t in sub_trends) >= 5
 
-# ── EMA 50 ─────────────────────────────────────
 def check_ema50_below(df):
     if len(df) < WARMUP_EMA: return False
-    # ✅ min_periods=50 + warm-up كامل + قراءة [-2]
     ema = df["close"].ewm(span=50, min_periods=50, adjust=False).mean()
     return bool(df["close"].iloc[-2] < ema.iloc[-2])
 
-# ── SMI ────────────────────────────────────────
 def calc_smi(high, low, close, k=10, d=3, ema_len=10, smooth=1):
-    """
-    ✅ min_periods مضاف لكل rolling/ewm
-    مطابق TradingView SMI Ergodic
-    """
     hh    = high.rolling(k, min_periods=k).max()
     ll    = low.rolling(k, min_periods=k).min()
     diff  = hh - ll
     rdiff = close - (hh + ll) / 2
-
     avgrel  = rdiff.ewm(span=d, min_periods=d, adjust=False).mean()
     avgdiff = diff.ewm(span=d, min_periods=d, adjust=False).mean()
-
     smi_arr = np.where(avgdiff != 0, (avgrel / (avgdiff / 2)) * 100, 0.0)
     smi     = pd.Series(smi_arr, index=close.index)
-
     if smooth > 1:
         smi = smi.rolling(smooth, min_periods=smooth).mean()
-
     sig = smi.ewm(span=ema_len, min_periods=ema_len, adjust=False).mean()
     return smi, sig
 
 def check_smi_oversold(df, threshold=-40):
     if len(df) < WARMUP_SMI: return False
     smi, _ = calc_smi(df["high"], df["low"], df["close"])
-    # ✅ شمعة مغلقة [-2]
     return bool(smi.iloc[-2] <= threshold)
 
 def get_smi_value(df):
@@ -484,15 +461,7 @@ def get_smi_value(df):
     smi, sig = calc_smi(df["high"], df["low"], df["close"])
     return round(float(smi.iloc[-2]), 2), round(float(sig.iloc[-2]), 2)
 
-# ── RSI (Wilder's — مطابق TradingView 100%) ────
 def calc_rsi_tv(close, period=14):
-    """
-    Pine Script:
-    up   = rma(max(change(src), 0), length)
-    down = rma(-min(change(src), 0), length)
-    rsi  = 100 - 100/(1 + up/down)
-    ✅ min_periods=period لضمان warm-up صحيح
-    """
     delta = close.diff()
     gain  = delta.clip(lower=0)
     loss  = (-delta.clip(upper=0))
@@ -500,14 +469,7 @@ def calc_rsi_tv(close, period=14):
     down  = wilder_rma(loss, period)
     return 100.0 - (100.0 / (1.0 + up / (down + 1e-10)))
 
-# ── Stochastic (SMA — مطابق TradingView) ───────
 def calc_stoch_tv(close, high, low, k_len=15, k_smooth=3, d_smooth=3):
-    """
-    Pine Script:
-    k = sma(stoch(close,high,low,length), smoothK)
-    d = sma(k, smoothD)
-    ✅ SMA وليس EMA + min_periods
-    """
     lo  = low.rolling(k_len, min_periods=k_len).min()
     hi  = high.rolling(k_len, min_periods=k_len).max()
     raw = 100.0 * (close - lo) / (hi - lo + 1e-10)
@@ -515,52 +477,145 @@ def calc_stoch_tv(close, high, low, k_len=15, k_smooth=3, d_smooth=3):
     d   = k.rolling(d_smooth, min_periods=d_smooth).mean()
     return k, d
 
-# ── check_rsi_stoch ─────────────────────────────
 def check_rsi_stoch(df, lookback=10):
-    """
-    ✅ كل الفحوصات على شموع مغلقة فقط range(-lookback, -1)
-    ✅ RSI بـ Wilder's RMA الصحيح
-    ✅ Stochastic بـ SMA مطابق TradingView
-    ✅ Warm-up كافٍ قبل القراءة
-    """
     if len(df) < WARMUP_RSI: return False
-
     close = df["close"]
     high  = df["high"]
     low   = df["low"]
-
-    # ── RSI ──
     rsi    = calc_rsi_tv(close, period=14)
     rsi_ma = rsi.rolling(14, min_periods=14).mean()
-
-    # فحص على شموع مغلقة فقط [-20:-1]
     if rsi.iloc[-20:-1].min() > 35:
         return False
-
-    # تقاطع RSI فوق MA — شموع مغلقة فقط
     rsi_cross = any(
         rsi.iloc[i-1] < rsi_ma.iloc[i-1] and rsi.iloc[i] >= rsi_ma.iloc[i]
         for i in range(-lookback, -1)
     )
     if not rsi_cross:
         return False
-
-    # ── Stochastic ──
     k, d = calc_stoch_tv(close, high, low, k_len=15, k_smooth=3, d_smooth=3)
-
-    # تقاطع K فوق 20 — شموع مغلقة فقط
     cross_20 = any(
         k.iloc[i-1] <= 20 and k.iloc[i] > 20
         for i in range(-lookback, -1)
     )
-
-    # تقاطع K فوق D — شموع مغلقة فقط
     cross_d = any(
         k.iloc[i-1] <= d.iloc[i-1] and k.iloc[i] > d.iloc[i]
         for i in range(-lookback, -1)
     )
-
     return rsi_cross and cross_20 and cross_d
+
+# ──────────────────────────────────────────────
+# /check5 helper
+# ──────────────────────────────────────────────
+def handle_check5(chat_id, symbol="BTCUSDT"):
+    send_telegram(f"🔄 جاري جلب بيانات {symbol} — فريم 5 دقايق...", chat_id)
+    try:
+        # نجيب 600 شمعة 1m = 10 ساعات كافية للـ warm-up
+        df_raw = get_ohlcv(symbol, "1m", limit=600)
+
+        # إذا الكاش فيه بيانات أكثر نستخدمه
+        cached = get_cached(symbol, "1m")
+        if not cached.empty and len(cached) > len(df_raw):
+            df_raw = cached
+
+        if df_raw.empty:
+            send_telegram("❌ فشل جلب البيانات من KuCoin", chat_id)
+            return
+
+        df5 = resample_ohlcv(df_raw, 5)
+
+        if df5.empty or len(df5) < MIN_CANDLES:
+            send_telegram(
+                f"⚠️ شموع غير كافية: {len(df5)} (المطلوب {MIN_CANDLES})\n"
+                f"💡 جرب بعد اكتمال التحميل الكامل", chat_id
+            )
+            return
+
+        # ── الشمعة المغلقة الأخيرة [-2] ──
+        price      = df5["close"].iloc[-2]
+        candle_ts  = df5["ts"].iloc[-2].strftime("%Y-%m-%d %H:%M UTC")
+        fetch_ts   = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+
+        # RSI
+        rsi_series = calc_rsi_tv(df5["close"], period=14)
+        rsi_val    = round(float(rsi_series.iloc[-2]), 2)
+
+        # Stochastic
+        k_series, d_series = calc_stoch_tv(df5["close"], df5["high"], df5["low"])
+        stoch_k = round(float(k_series.iloc[-2]), 2)
+        stoch_d = round(float(d_series.iloc[-2]), 2)
+
+        # MACD
+        macd_line, signal_line, histogram = _calc_macd_full(df5["close"])
+        macd_hist_val   = round(float(histogram.iloc[-2]), 4)
+        macd_line_val   = round(float(macd_line.iloc[-2]), 4)
+        signal_line_val = round(float(signal_line.iloc[-2]), 4)
+        macd_color      = "🟢" if macd_hist_val > 0 else "🔴"
+
+        # SMI
+        smi_val, smi_sig = get_smi_value(df5)
+
+        # Donchian
+        don_green = check_donchian_ribbon(df5, direction="green")
+        don_red   = check_donchian_ribbon(df5, direction="red")
+        if don_green:
+            don_color = "🟢 أخضر (صاعد)"
+        elif don_red:
+            don_color = "🔴 أحمر (هابط)"
+        else:
+            don_color = "⚪ محايد"
+
+        # RSI zone
+        if rsi_val < 30:
+            rsi_zone = "🔴 تشبع بيعي"
+        elif rsi_val > 70:
+            rsi_zone = "🟠 تشبع شرائي"
+        else:
+            rsi_zone = "🟡 محايد"
+
+        # Stoch zone
+        if stoch_k < 20:
+            stoch_zone = "🔴 تشبع بيعي"
+        elif stoch_k > 80:
+            stoch_zone = "🟠 تشبع شرائي"
+        else:
+            stoch_zone = "🟡 محايد"
+
+        # SMI zone
+        if smi_val is not None and smi_val <= -40:
+            smi_zone = "🔴 تشبع بيعي"
+        elif smi_val is not None and smi_val >= 40:
+            smi_zone = "🟠 تشبع شرائي"
+        else:
+            smi_zone = "🟡 محايد"
+
+        send_telegram(
+            f"📊 <b>{symbol} — فريم 5 دقايق</b>\n"
+            f"🕯️ الشمعة المغلقة: <b>{candle_ts}</b>\n"
+            f"🕐 وقت الجلب: {fetch_ts}\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"💰 السعر: <b>{price:.2f}$</b>\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"🎀 Donchian Ribbon (20): {don_color}\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"📈 RSI (14): <b>{rsi_val}</b>  {rsi_zone}\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"📉 Stoch K(15,3): <b>{stoch_k}</b>  {stoch_zone}\n"
+            f"    Stoch D(3):   <b>{stoch_d}</b>\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"⚡ MACD Histogram: {macd_color} <b>{macd_hist_val}</b>\n"
+            f"    MACD Line:     <b>{macd_line_val}</b>\n"
+            f"    Signal Line:   <b>{signal_line_val}</b>\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"🔵 SMI: <b>{smi_val}</b>  {smi_zone}\n"
+            f"    Signal: <b>{smi_sig}</b>\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"📦 شموع الـ5m: {len(df5)} | بيانات الـ1m: {len(df_raw)}",
+            chat_id
+        )
+
+    except Exception as e:
+        log.error(f"check5 error: {e}")
+        send_telegram(f"❌ خطأ في /check5: {e}", chat_id)
 
 # ──────────────────────────────────────────────
 # Diagnostics
@@ -648,17 +703,14 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
     df_confirm = resample_ohlcv(raw_ec, confirm_min)
     df_third   = resample_ohlcv(raw_t,  third_min)
 
-    # ✅ نتحقق من وجود شموع كافية للـ warm-up
     if any(d.empty or len(d) < MIN_CANDLES for d in [df_entry, df_confirm, df_third]):
         with diag_lock: diag_counts["no_data"] += 1
         return
 
-    # ① SMI تشبع بيعي
     if not check_smi_oversold(df_entry):
         with diag_lock: diag_counts["smi_oversold"] += 1
         return
 
-    # ⭐ active_skip
     next_tf = NEXT_TF.get(entry_min)
     if next_tf is not None:
         df_next = resample_ohlcv(raw_ec, next_tf)
@@ -682,22 +734,18 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
     with near_signals_6_lock:
         near_signals_6.pop(near_key, None)
 
-    # ③ MACD أحمر
     if not check_macd_red(df_entry):
         with diag_lock: diag_counts["macd_red"] += 1
         return
 
-    # ④ Donchian Entry أخضر
     if not check_donchian_ribbon(df_entry, direction="green"):
         with diag_lock: diag_counts["donchian_entry"] += 1
         return
 
-    # ⑤ Donchian Confirm أخضر
     if not check_donchian_ribbon(df_confirm, direction="green"):
         with diag_lock: diag_counts["donchian_confirm"] += 1
         return
 
-    # ⑥ MACD Confirm أخضر — تنبيه مبكر
     if not check_macd_green(df_confirm):
         with diag_lock: diag_counts["macd_confirm"] += 1
         return
@@ -715,12 +763,10 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
                 f"⚠️ باقي: EMA50 + RSI/Stoch"
             )
 
-    # ⑦ EMA50
     if not check_ema50_below(df_entry):
         with diag_lock: diag_counts["ema50"] += 1
         return
 
-    # ⑧ RSI/Stoch
     if not check_rsi_stoch(df_third):
         with diag_lock: diag_counts["rsi_stoch"] += 1
         price = df_entry["close"].iloc[-2]
@@ -733,7 +779,6 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
             }
         return
 
-    # ✅ اجتاز كل الشروط
     with near_signals_lock:
         near_signals.pop(near_key, None)
     with near_signals_6_lock:
@@ -912,6 +957,18 @@ def poll_telegram_commands():
                         fast_prefetch_done.clear(); prefetch_done.clear()
                         threading.Thread(target=prefetch_all, args=(syms,), daemon=True).start()
                         send_telegram(f"🚀 بدأ إعادة التحميل لـ {len(syms)} عملة...", chat_id)
+
+                # ── /check5 ──────────────────────────────────────────
+                elif txt.startswith("/check5"):
+                    parts = txt.split()
+                    symbol = parts[1].upper() if len(parts) > 1 else "BTCUSDT"
+                    if not symbol.endswith("USDT"):
+                        symbol = symbol + "USDT"
+                    threading.Thread(
+                        target=handle_check5, args=(chat_id, symbol), daemon=True
+                    ).start()
+                # ─────────────────────────────────────────────────────
+
                 elif txt == "/help":
                     send_telegram(
                         "📋 <b>الأوامر المتاحة:</b>\n"
@@ -925,6 +982,7 @@ def poll_telegram_commands():
                         "🧪  <code>/fetchtest</code> — اختبار KuCoin\n"
                         "🔄  <code>/reload</code> — إعادة تحميل الكاش\n"
                         "🔍  <code>/سبب</code> — تشخيص الإشارات\n"
+                        "📊  <code>/check5</code> — قراءة BTC 5 دقايق (أو /check5 ETH)\n"
                         "📋  <code>/help</code> — قائمة الأوامر",
                         chat_id,
                     )
@@ -981,6 +1039,15 @@ class HealthHandler(BaseHTTPRequestHandler):
 # ──────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────
+def check5_watcher():
+    while True:
+        nxt  = get_next_close(5)
+        wait = (nxt - datetime.now(timezone.utc)).total_seconds()
+        time.sleep(max(wait, 0) + 2.0)
+        if not fast_prefetch_done.is_set():
+            continue
+        handle_check5(TELEGRAM_CHAT_ID, "BTCUSDT")
+
 def main():
     log.info("🚀 Tripling Strategy Bot — KuCoin API (TV-Match v2)")
     delete_webhook()
@@ -997,6 +1064,7 @@ def main():
     log.info("⏳ انتظار اكتمال التحميل السريع…")
     fast_prefetch_done.wait()
     log.info("✅ بدء الواتشرز")
+    threading.Thread(target=check5_watcher, daemon=True).start()
     for entry_min, confirm_min, third_min, ec_api, t_api in TRIPLING_PAIRS:
         threading.Thread(
             target=candle_watcher,
