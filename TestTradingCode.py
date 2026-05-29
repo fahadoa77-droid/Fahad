@@ -20,7 +20,7 @@ log = logging.getLogger(__name__)
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN",   "8988740597:AAE_I7M7zB5VM2NykUwreQQMws0vk7qlU78")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "7801703329")
 
-BINANCE_BASE      = "https://api.binance.com"
+BINANCE_BASE = "https://data-api.binance.vision"
 TOP_SYMBOLS_LIMIT = 200
 PORT              = int(os.environ.get("PORT", "8080"))
 ALERT_EXPIRY_HOURS = 4
