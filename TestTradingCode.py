@@ -9,6 +9,7 @@ from collections import deque
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -19,16 +20,12 @@ log = logging.getLogger(__name__)
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN",   "8988740597:AAE_I7M7zB5VM2NykUwreQQMws0vk7qlU78")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "7801703329")
 
-# Binance API — للقراءة العامة لا يحتاج مفتاح
 BINANCE_BASE      = "https://api.binance.com"
 TOP_SYMBOLS_LIMIT = 200
 PORT              = int(os.environ.get("PORT", "8080"))
 ALERT_EXPIRY_HOURS = 4
 NEAR6_EXPIRY_HOURS = 2
 
-# ──────────────────────────────────────────────
-# تعيين الفريمات
-# ──────────────────────────────────────────────
 TF_MAP = {"1m": "1m", "60m": "1h"}
 
 TRIPLING_PAIRS = [
@@ -83,17 +80,9 @@ fast_prefetch_done = threading.Event()
 prefetch_done      = threading.Event()
 
 diag_counts = {
-    "total"           : 0,
-    "no_data"         : 0,
-    "smi_oversold"    : 0,
-    "active_skip"     : 0,
-    "macd_red"        : 0,
-    "donchian_entry"  : 0,
-    "donchian_confirm": 0,
-    "macd_confirm"    : 0,
-    "ema50"           : 0,
-    "rsi_stoch"       : 0,
-    "passed"          : 0,
+    "total": 0, "no_data": 0, "smi_oversold": 0, "active_skip": 0,
+    "macd_red": 0, "donchian_entry": 0, "donchian_confirm": 0,
+    "macd_confirm": 0, "ema50": 0, "rsi_stoch": 0, "passed": 0,
 }
 diag_lock         = threading.Lock()
 cache_diag_logged = threading.Event()
@@ -179,20 +168,18 @@ def get_report(period="today"):
     return "\n".join(lines)
 
 # ──────────────────────────────────────────────
-# Binance API
+# Binance OHLCV
 # ──────────────────────────────────────────────
 def _parse_binance_klines(resp):
     df = pd.DataFrame(resp, columns=[
-        "ts", "open", "high", "low", "close", "vol",
-        "close_time", "quote_vol", "trades",
-        "taker_buy_base", "taker_buy_quote", "ignore"
+        "ts","open","high","low","close","vol",
+        "close_time","quote_vol","trades",
+        "taker_buy_base","taker_buy_quote","ignore"
     ])
-    for c in ["open", "high", "low", "close", "vol"]:
+    for c in ["open","high","low","close","vol"]:
         df[c] = df[c].astype(float)
     df["ts"] = pd.to_datetime(df["ts"].astype(int), unit="ms", utc=True)
-    return df.sort_values("ts").reset_index(drop=True)[
-        ["ts", "open", "high", "low", "close", "vol"]
-    ]
+    return df.sort_values("ts").reset_index(drop=True)[["ts","open","high","low","close","vol"]]
 
 def get_ohlcv(symbol, tf, limit=500):
     binance_tf = TF_MAP.get(tf, "1m")
@@ -289,23 +276,6 @@ def cache_updater_60m():
             with symbols_cache_lock: syms = list(symbols_cache)
             if syms: _update_batch(syms, "60m", limit=5)
 
-def update_symbols_loop():
-    while True:
-        try:
-            resp = get_session().get(f"{BINANCE_BASE}/api/v3/ticker/24hr").json()
-            top = sorted(
-                [t for t in resp if t["symbol"].endswith("USDT")],
-                key=lambda x: float(x.get("quoteVolume", 0)),
-                reverse=True
-            )[:TOP_SYMBOLS_LIMIT]
-            with symbols_cache_lock:
-                symbols_cache[:] = [t["symbol"] for t in top]
-            if not fast_prefetch_done.is_set():
-                threading.Thread(target=prefetch_all, args=(list(symbols_cache),), daemon=True).start()
-        except Exception as e:
-            log.error(f"update_symbols_loop: {e}")
-        time.sleep(3600)
-
 # ──────────────────────────────────────────────
 # المؤشرات الفنية
 # ──────────────────────────────────────────────
@@ -316,15 +286,29 @@ def resample_ohlcv(df, minutes):
              .agg({"open":"first","high":"max","low":"min","close":"last","vol":"sum"})
              .dropna().iloc[:-1].reset_index())
 
+def wilder_rma(series, period):
+    return series.ewm(alpha=1.0/period, min_periods=period, adjust=False).mean()
+
+def _calc_macd_hist(close):
+    ml  = close.ewm(span=12, min_periods=12, adjust=False).mean() \
+        - close.ewm(span=26, min_periods=26, adjust=False).mean()
+    sig = ml.ewm(span=9, min_periods=9, adjust=False).mean()
+    return ml - sig
+
+def _calc_macd_full(close):
+    macd_line   = close.ewm(span=12, min_periods=12, adjust=False).mean() \
+                - close.ewm(span=26, min_periods=26, adjust=False).mean()
+    signal_line = macd_line.ewm(span=9, min_periods=9, adjust=False).mean()
+    histogram   = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
 def check_macd_red(df):
-    ml  = df["close"].ewm(span=12, adjust=False).mean() - df["close"].ewm(span=26, adjust=False).mean()
-    sig = ml.ewm(span=9, adjust=False).mean()
-    return bool((ml - sig).iloc[-2] < 0)
+    if len(df) < WARMUP_MACD: return False
+    return bool(_calc_macd_hist(df["close"]).iloc[-2] < 0)
 
 def check_macd_green(df):
-    ml  = df["close"].ewm(span=12, adjust=False).mean() - df["close"].ewm(span=26, adjust=False).mean()
-    sig = ml.ewm(span=9, adjust=False).mean()
-    return bool((ml - sig).iloc[-2] > 0)
+    if len(df) < WARMUP_MACD: return False
+    return bool(_calc_macd_hist(df["close"]).iloc[-2] > 0)
 
 def check_donchian_ribbon(df, direction="green"):
     hh = df["high"].rolling(20).max().shift(1)
@@ -336,19 +320,150 @@ def check_ema50_below(df):
     ema = df["close"].ewm(span=50, adjust=False).mean()
     return bool(df["close"].iloc[-2] < ema.iloc[-2])
 
-def check_smi_oversold(df):
-    hh  = df["high"].rolling(10).max()
-    ll  = df["low"].rolling(10).min()
-    smi = ((df["close"] - (hh + ll) / 2) / ((hh - ll) / 2 + 1e-10)) * 100
-    return bool(smi.iloc[-2] <= -40)
+def calc_smi(high, low, close, k=10, d=3, ema_len=10, smooth=1):
+    hh      = high.rolling(k, min_periods=k).max()
+    ll      = low.rolling(k, min_periods=k).min()
+    diff    = hh - ll
+    rdiff   = close - (hh + ll) / 2
+    avgrel  = rdiff.ewm(span=d, min_periods=d, adjust=False).mean()
+    avgdiff = diff.ewm(span=d, min_periods=d, adjust=False).mean()
+    smi_arr = np.where(avgdiff != 0, (avgrel / (avgdiff / 2)) * 100, 0.0)
+    smi     = pd.Series(smi_arr, index=close.index)
+    if smooth > 1:
+        smi = smi.rolling(smooth, min_periods=smooth).mean()
+    sig = smi.ewm(span=ema_len, min_periods=ema_len, adjust=False).mean()
+    return smi, sig
+
+def check_smi_oversold(df, threshold=-40):
+    if len(df) < WARMUP_SMI: return False
+    smi, _ = calc_smi(df["high"], df["low"], df["close"])
+    return bool(smi.iloc[-2] <= threshold)
+
+def get_smi_value(df):
+    if len(df) < WARMUP_SMI: return None, None
+    smi, sig = calc_smi(df["high"], df["low"], df["close"])
+    return round(float(smi.iloc[-2]), 2), round(float(sig.iloc[-2]), 2)
+
+def calc_rsi_tv(close, period=14):
+    delta = close.diff()
+    gain  = delta.clip(lower=0)
+    loss  = (-delta.clip(upper=0))
+    up    = wilder_rma(gain, period)
+    down  = wilder_rma(loss, period)
+    return 100.0 - (100.0 / (1.0 + up / (down + 1e-10)))
+
+def calc_stoch_tv(close, high, low, k_len=15, k_smooth=3, d_smooth=3):
+    lo  = low.rolling(k_len, min_periods=k_len).min()
+    hi  = high.rolling(k_len, min_periods=k_len).max()
+    raw = 100.0 * (close - lo) / (hi - lo + 1e-10)
+    k   = raw.rolling(k_smooth, min_periods=k_smooth).mean()
+    d   = k.rolling(d_smooth, min_periods=d_smooth).mean()
+    return k, d
 
 def check_rsi_stoch(df):
+    if len(df) < WARMUP_RSI: return False
     delta = df["close"].diff()
     rsi   = 100 - (100 / (1 + (delta.clip(lower=0).ewm(span=14).mean() /
                                (-delta.clip(upper=0).ewm(span=14).mean() + 1e-10))))
     k     = ((df["close"] - df["low"].rolling(15).min()) /
              (df["high"].rolling(15).max() - df["low"].rolling(15).min() + 1e-10) * 100)
     return bool(rsi.iloc[-2] < 35 and k.iloc[-2] < 20)
+
+# ──────────────────────────────────────────────
+# check5 — تقرير BTC كل 5 دقايق
+# ──────────────────────────────────────────────
+def handle_check5(chat_id, symbol="BTCUSDT"):
+    send_telegram(f"🔄 جاري جلب بيانات {symbol} — فريم 5 دقايق...", chat_id)
+    try:
+        df_raw = get_ohlcv(symbol, "1m", limit=600)
+        cached = get_cached(symbol, "1m")
+        if not cached.empty and len(cached) > len(df_raw):
+            df_raw = cached
+
+        if df_raw.empty:
+            send_telegram("❌ فشل جلب البيانات من Binance", chat_id)
+            return
+
+        df5 = resample_ohlcv(df_raw, 5)
+
+        if df5.empty or len(df5) < MIN_CANDLES:
+            send_telegram(
+                f"⚠️ شموع غير كافية: {len(df5)} (المطلوب {MIN_CANDLES})\n"
+                f"💡 جرب بعد اكتمال التحميل الكامل", chat_id
+            )
+            return
+
+        price      = df5["close"].iloc[-2]
+        candle_ts  = df5["ts"].iloc[-2].strftime("%Y-%m-%d %H:%M UTC")
+        fetch_ts   = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+
+        rsi_series = calc_rsi_tv(df5["close"], period=14)
+        rsi_val    = round(float(rsi_series.iloc[-2]), 2)
+
+        k_series, d_series = calc_stoch_tv(df5["close"], df5["high"], df5["low"])
+        stoch_k = round(float(k_series.iloc[-2]), 2)
+        stoch_d = round(float(d_series.iloc[-2]), 2)
+
+        macd_line, signal_line, histogram = _calc_macd_full(df5["close"])
+        macd_hist_val   = round(float(histogram.iloc[-2]), 4)
+        macd_line_val   = round(float(macd_line.iloc[-2]), 4)
+        signal_line_val = round(float(signal_line.iloc[-2]), 4)
+        macd_color      = "🟢" if macd_hist_val > 0 else "🔴"
+
+        smi_val, smi_sig = get_smi_value(df5)
+
+        don_green = check_donchian_ribbon(df5, direction="green")
+        don_red   = check_donchian_ribbon(df5, direction="red")
+        if don_green:   don_color = "🟢 أخضر (صاعد)"
+        elif don_red:   don_color = "🔴 أحمر (هابط)"
+        else:           don_color = "⚪ محايد"
+
+        rsi_zone   = "🔴 تشبع بيعي" if rsi_val < 30 else ("🟠 تشبع شرائي" if rsi_val > 70 else "🟡 محايد")
+        stoch_zone = "🔴 تشبع بيعي" if stoch_k < 20 else ("🟠 تشبع شرائي" if stoch_k > 80 else "🟡 محايد")
+        smi_zone   = ("🔴 تشبع بيعي" if smi_val is not None and smi_val <= -40
+                      else ("🟠 تشبع شرائي" if smi_val is not None and smi_val >= 40 else "🟡 محايد"))
+
+        send_telegram(
+            f"📊 <b>{symbol} — فريم 5 دقايق</b>\n"
+            f"🕯️ الشمعة المغلقة: <b>{candle_ts}</b>\n"
+            f"🕐 وقت الجلب: {fetch_ts}\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"💰 السعر: <b>{price:.2f}$</b>\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"🎀 Donchian Ribbon (20): {don_color}\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"📈 RSI (14): <b>{rsi_val}</b>  {rsi_zone}\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"📉 Stoch K(15,3): <b>{stoch_k}</b>  {stoch_zone}\n"
+            f"    Stoch D(3):   <b>{stoch_d}</b>\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"⚡ MACD Histogram: {macd_color} <b>{macd_hist_val}</b>\n"
+            f"    MACD Line:     <b>{macd_line_val}</b>\n"
+            f"    Signal Line:   <b>{signal_line_val}</b>\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"🔵 SMI: <b>{smi_val}</b>  {smi_zone}\n"
+            f"    Signal: <b>{smi_sig}</b>\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"📦 شموع الـ5m: {len(df5)} | بيانات الـ1m: {len(df_raw)}",
+            chat_id
+        )
+    except Exception as e:
+        log.error(f"check5 error: {e}")
+        send_telegram(f"❌ خطأ في /check5: {e}", chat_id)
+
+def get_next_close(tf_minutes):
+    now   = datetime.now(timezone.utc)
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    total = int((now - epoch).total_seconds() / 60)
+    return epoch + timedelta(minutes=((total // tf_minutes) + 1) * tf_minutes)
+
+def check5_watcher():
+    while True:
+        nxt  = get_next_close(5)
+        wait = (nxt - datetime.now(timezone.utc)).total_seconds()
+        time.sleep(max(wait, 0) + 2.0)
+        if not fast_prefetch_done.is_set(): continue
+        handle_check5(TELEGRAM_CHAT_ID, "BTCUSDT")
 
 # ──────────────────────────────────────────────
 # المسح والمراقبة
@@ -378,35 +493,92 @@ def candle_watcher(entry_min, confirm_min, third_min, ec_api, t_api):
         with ThreadPoolExecutor(max_workers=20) as ex:
             ex.map(fn, syms)
 
+# ──────────────────────────────────────────────
+# أوامر تيليغرام
+# ──────────────────────────────────────────────
 def poll_telegram_commands():
     last_id = 0
     while True:
         try:
             r = get_session().get(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
-                params={"offset": last_id + 1, "timeout": 30}
+                params={"offset": last_id + 1, "timeout": 30}, timeout=35,
             ).json()
             for upd in r.get("result", []):
                 last_id = upd["update_id"]
-                txt     = upd.get("message", {}).get("text", "")
+                txt     = upd.get("message", {}).get("text", "").strip()
                 chat_id = str(upd.get("message", {}).get("chat", {}).get("id", ""))
+                if not txt or not chat_id: continue
+
                 if txt == "/status":
-                    send_telegram("🤖 البوت يعمل بكفاءة.", chat_id)
-                elif txt == "/today":
+                    send_telegram("🤖 البوت يعمل بكفاءة — Binance API.", chat_id)
+                elif txt in ("1", "/today"):
                     send_telegram(get_report("today"), chat_id)
-                elif txt == "/yesterday":
+                elif txt in ("2", "/yesterday"):
                     send_telegram(get_report("yesterday"), chat_id)
-                elif txt == "/week":
+                elif txt in ("3", "/week"):
                     send_telegram(get_report("week"), chat_id)
+                elif txt.startswith("/check5"):
+                    parts  = txt.split()
+                    symbol = parts[1].upper() if len(parts) > 1 else "BTCUSDT"
+                    if not symbol.endswith("USDT"): symbol += "USDT"
+                    threading.Thread(
+                        target=handle_check5, args=(chat_id, symbol), daemon=True
+                    ).start()
+                elif txt == "/help":
+                    send_telegram(
+                        "📋 <b>الأوامر المتاحة:</b>\n"
+                        "📊 <code>/check5</code> — تقرير BTC فريم 5 دقايق\n"
+                        "📊 <code>/check5 ETH</code> — تقرير ETH فريم 5 دقايق\n"
+                        "1️⃣ <code>1</code> — إشارات اليوم\n"
+                        "2️⃣ <code>2</code> — إشارات أمس\n"
+                        "3️⃣ <code>3</code> — آخر 7 أيام\n"
+                        "📊 <code>/status</code> — حالة البوت\n"
+                        "📋 <code>/help</code> — قائمة الأوامر",
+                        chat_id,
+                    )
         except:
             time.sleep(10)
 
+# ──────────────────────────────────────────────
+# Symbols Loop
+# ──────────────────────────────────────────────
+def update_symbols_loop():
+    while True:
+        try:
+            resp = get_session().get(f"{BINANCE_BASE}/api/v3/ticker/24hr").json()
+            top = sorted(
+                [t for t in resp if t["symbol"].endswith("USDT")],
+                key=lambda x: float(x.get("quoteVolume", 0)),
+                reverse=True
+            )[:TOP_SYMBOLS_LIMIT]
+            with symbols_cache_lock:
+                symbols_cache[:] = [t["symbol"] for t in top]
+            if not fast_prefetch_done.is_set():
+                threading.Thread(target=prefetch_all, args=(list(symbols_cache),), daemon=True).start()
+        except Exception as e:
+            log.error(f"update_symbols_loop: {e}")
+        time.sleep(3600)
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
+    def log_message(self, *_): pass
+
+# ──────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────
 def main():
     delete_webhook()
     threading.Thread(target=update_symbols_loop,    daemon=True).start()
     threading.Thread(target=poll_telegram_commands,  daemon=True).start()
     threading.Thread(target=cache_updater_1m,        daemon=True).start()
     threading.Thread(target=cache_updater_60m,       daemon=True).start()
+    threading.Thread(target=check5_watcher,          daemon=True).start()
+    threading.Thread(
+        target=lambda: HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever(),
+        daemon=True,
+    ).start()
     for params in TRIPLING_PAIRS:
         threading.Thread(target=candle_watcher, args=params, daemon=True).start()
     while True:
