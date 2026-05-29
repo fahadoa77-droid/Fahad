@@ -547,13 +547,23 @@ def update_symbols_loop():
     while True:
         try:
             resp = get_session().get(f"{BINANCE_BASE}/api/v3/ticker/24hr").json()
+            # Binance يرجع list من dicts
+            if isinstance(resp, list):
+                tickers = resp
+            elif isinstance(resp, dict):
+                tickers = resp.get("data", [])
+            else:
+                tickers = []
+
             top = sorted(
-                [t for t in resp if t["symbol"].endswith("USDT")],
+                [t for t in tickers if isinstance(t, dict) and t.get("symbol", "").endswith("USDT")],
                 key=lambda x: float(x.get("quoteVolume", 0)),
                 reverse=True
             )[:TOP_SYMBOLS_LIMIT]
+
             with symbols_cache_lock:
                 symbols_cache[:] = [t["symbol"] for t in top]
+            log.info(f"✅ عملات: {len(symbols_cache)} — أول 5: {symbols_cache[:5]}")
             if not fast_prefetch_done.is_set():
                 threading.Thread(target=prefetch_all, args=(list(symbols_cache),), daemon=True).start()
         except Exception as e:
