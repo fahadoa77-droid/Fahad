@@ -14,15 +14,23 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "8298845980:AAFrhgrdngO6b1vV9poLyw7c_yT0afTkMg4")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "-1003853071475")
-TOP_SYMBOLS_LIMIT = 100
-PORT = int(os.environ.get("PORT", "8080"))
+# ──────────────────────────────────────────────
+# ⚙️ الإعدادات الرئيسية
+# ──────────────────────────────────────────────
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "ضع_توكن_تلقرام_هنا")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "ضع_chat_id_هنا")
+
+# MEXC API — للقراءة العامة لا يحتاج مفتاح
+MEXC_BASE         = "https://api.mexc.com"
+TOP_SYMBOLS_LIMIT = 200          # ← رفعنا من 100 إلى 200
+PORT              = int(os.environ.get("PORT", "8080"))
 ALERT_EXPIRY_HOURS = 4
 NEAR6_EXPIRY_HOURS = 2
 
-KUCOIN_BASE = "https://api.kucoin.com"
-TF_MAP = {"1m": "1min", "60m": "1hour"}
+# ──────────────────────────────────────────────
+# تعيين الفريمات — MEXC يستخدم "1m" و "60m" مباشرة
+# ──────────────────────────────────────────────
+TF_MAP = {"1m": "1m", "60m": "60m"}
 
 TRIPLING_PAIRS = [
     (  9,  27,  3, "1m", "1m"),
@@ -56,6 +64,9 @@ WARMUP_STOCH = 100
 WARMUP_DON   = 50
 MIN_CANDLES  = 250
 
+# ──────────────────────────────────────────────
+# الحالة المشتركة
+# ──────────────────────────────────────────────
 alerted_keys        = {}
 alerted_keys_lock   = threading.Lock()
 trades_history      = deque(maxlen=2000)
@@ -92,14 +103,6 @@ _local            = threading.local()
 # ──────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────
-def to_kucoin_symbol(symbol):
-    if "-" in symbol: return symbol
-    if symbol.endswith("USDT"): return symbol[:-4] + "-USDT"
-    return symbol
-
-def from_kucoin_symbol(symbol):
-    return symbol.replace("-", "")
-
 def get_session():
     if not hasattr(_local, "s"):
         s = requests.Session()
@@ -179,60 +182,85 @@ def get_report(period="today"):
     return "\n".join(lines)
 
 # ──────────────────────────────────────────────
-# OHLCV
+# ✅ MEXC OHLCV — Parser
 # ──────────────────────────────────────────────
-def _parse_klines(resp):
-    df = pd.DataFrame(resp, columns=["ts","open","close","high","low","vol","turnover"])
-    for c in ["open","high","low","close","vol"]: df[c] = df[c].astype(float)
-    df["ts"] = pd.to_datetime(df["ts"].astype(int), unit="s", utc=True)
-    return df.sort_values("ts").reset_index(drop=True)[["ts","open","high","low","close","vol"]]
+def _parse_mexc_klines(resp):
+    """
+    MEXC format:
+    [open_time, open, high, low, close, volume,
+     close_time, quote_vol, trades,
+     taker_buy_base, taker_buy_quote, ignore]
+    الـ timestamp بالـ milliseconds
+    """
+    df = pd.DataFrame(resp, columns=[
+        "ts", "open", "high", "low", "close", "vol",
+        "close_time", "quote_vol", "trades",
+        "taker_buy_base", "taker_buy_quote", "ignore"
+    ])
+    for c in ["open", "high", "low", "close", "vol"]:
+        df[c] = df[c].astype(float)
+    df["ts"] = pd.to_datetime(df["ts"].astype(int), unit="ms", utc=True)
+    return df.sort_values("ts").reset_index(drop=True)[
+        ["ts", "open", "high", "low", "close", "vol"]
+    ]
 
+# ──────────────────────────────────────────────
+# ✅ MEXC get_ohlcv
+# ──────────────────────────────────────────────
 def get_ohlcv(symbol, tf, limit=500):
-    kc_sym    = to_kucoin_symbol(symbol)
-    kc_tf     = TF_MAP.get(tf, "1min")
-    end_sec   = int(time.time())
-    tf_sec    = 60 if tf == "1m" else 3600
-    start_sec = end_sec - limit * tf_sec
+    """جلب بيانات OHLCV من MEXC — الرمز بدون شرطة مثل BTCUSDT"""
+    mexc_tf = TF_MAP.get(tf, "1m")
     try:
         resp = get_session().get(
-            f"{KUCOIN_BASE}/api/v1/market/candles",
-            params={"symbol": kc_sym, "type": kc_tf,
-                    "startAt": start_sec, "endAt": end_sec},
+            f"{MEXC_BASE}/api/v3/klines",
+            params={
+                "symbol"  : symbol,
+                "interval": mexc_tf,
+                "limit"   : min(limit, 1000),   # MEXC max per request = 1000
+            },
             timeout=10,
         ).json()
-        data = resp.get("data", [])
-        if data: return _parse_klines(data)
+        if isinstance(resp, list) and resp:
+            return _parse_mexc_klines(resp)
         log.warning(f"⚠️ رد غير صالح {symbol}/{tf}: {str(resp)[:120]}")
     except Exception as e:
         log.error(f"get_ohlcv {symbol} {tf}: {e}")
     return pd.DataFrame()
 
+# ──────────────────────────────────────────────
+# ✅ MEXC get_ohlcv_full — جلب تاريخ طويل
+# ──────────────────────────────────────────────
 def get_ohlcv_full(symbol, tf, target):
-    kc_sym     = to_kucoin_symbol(symbol)
-    kc_tf      = TF_MAP.get(tf, "1min")
-    tf_sec     = 60 if tf == "1m" else 3600
-    KUCOIN_MAX = 1500
-    all_dfs, end_sec, fetched, retries = [], int(time.time()), 0, 0
+    mexc_tf  = TF_MAP.get(tf, "1m")
+    tf_ms    = 60_000 if tf == "1m" else 3_600_000   # milliseconds
+    MEXC_MAX = 1000
+    all_dfs, end_ms, fetched, retries = [], int(time.time() * 1000), 0, 0
+
     while fetched < target:
-        batch     = min(KUCOIN_MAX, target - fetched)
-        start_sec = end_sec - batch * tf_sec
+        batch    = min(MEXC_MAX, target - fetched)
+        start_ms = end_ms - batch * tf_ms
         try:
             resp = get_session().get(
-                f"{KUCOIN_BASE}/api/v1/market/candles",
-                params={"symbol": kc_sym, "type": kc_tf,
-                        "startAt": start_sec, "endAt": end_sec},
+                f"{MEXC_BASE}/api/v3/klines",
+                params={
+                    "symbol"   : symbol,
+                    "interval" : mexc_tf,
+                    "startTime": start_ms,
+                    "endTime"  : end_ms,
+                    "limit"    : batch,
+                },
                 timeout=15,
             ).json()
-            data = resp.get("data", [])
-            if not data:
+            if not isinstance(resp, list) or not resp:
                 retries += 1
                 if retries >= 3: break
                 time.sleep(2 ** retries); continue
-            df = _parse_klines(data)
+            df = _parse_mexc_klines(resp)
             all_dfs.insert(0, df)
-            fetched += len(df); retries = 0; end_sec = start_sec - 1
+            fetched += len(df); retries = 0
+            end_ms = start_ms - 1
             if len(df) < batch: break
-            time.sleep(0.2)
+            time.sleep(0.15)
         except requests.exceptions.Timeout:
             retries += 1
             if retries >= 3: break
@@ -242,9 +270,13 @@ def get_ohlcv_full(symbol, tf, target):
             log.error(f"full fetch {symbol}/{tf}: {e}")
             if retries >= 3: break
             time.sleep(2 ** retries)
+
     return (pd.concat(all_dfs).drop_duplicates(subset="ts")
             .sort_values("ts").reset_index(drop=True) if all_dfs else pd.DataFrame())
 
+# ──────────────────────────────────────────────
+# Cache helpers
+# ──────────────────────────────────────────────
 def cache_merge(symbol, tf, new_df):
     if new_df.empty: return
     key = (symbol, tf); maxc = CACHE_MAX_CANDLES.get(tf, 5000)
@@ -268,6 +300,7 @@ def prefetch_all(symbols):
     total = len(symbols)
     log.info(f"⚡ المرحلة الأولى (سريعة): {total} عملة")
     fast_success = fast_failed = 0
+
     for i, sym in enumerate(symbols):
         for tf, n in FAST_FETCH_CANDLES.items():
             fetched = False
@@ -282,7 +315,7 @@ def prefetch_all(symbols):
                     log.error(f"fast prefetch {sym} {tf} ({attempt+1}): {e}")
                     time.sleep(attempt + 1)
             if not fetched: fast_failed += 1
-            time.sleep(0.25)
+            time.sleep(0.2)
         if (i + 1) % 10 == 0 or i == total - 1:
             log.info(f"⚡ سريع: {i+1}/{total} | نجح: {fast_success} | فشل: {fast_failed}")
 
@@ -312,7 +345,7 @@ def prefetch_all(symbols):
                 df = get_ohlcv_full(sym, tf, target=n)
                 if not df.empty:
                     cache_merge(sym, tf, df); full_success += 1
-                time.sleep(0.25)
+                time.sleep(0.2)
             except Exception as e:
                 log.error(f"full prefetch {sym} {tf}: {e}")
         if (i + 1) % 10 == 0 or i == total - 1:
@@ -332,28 +365,60 @@ def prefetch_all(symbols):
         f"✔️ نجح: {full_success}/{total*2}\n\n" + "\n".join(diag_lines)
     )
 
+# ──────────────────────────────────────────────
+# ✅ تحديث الكاش المتوازي — بدلاً من التسلسلي
+# ──────────────────────────────────────────────
 def _update_batch(symbols, tf, limit):
-    for sym in symbols:
+    """تحديث متوازي بـ 30 worker — 200 عملة في 3-5 ثوانٍ"""
+    def fetch_one(sym):
         try:
             df = get_ohlcv(sym, tf, limit=limit)
-            if not df.empty: cache_merge(sym, tf, df)
-            time.sleep(0.15)
+            if not df.empty:
+                cache_merge(sym, tf, df)
         except Exception as e:
             log.error(f"update {sym} {tf}: {e}")
 
+    with ThreadPoolExecutor(max_workers=30) as ex:
+        ex.map(fetch_one, symbols)
+
 def cache_updater_1m():
+    """
+    ✅ تحديث ذكي للكاش:
+    - قبل 10 ثوانٍ من إغلاق الشمعة: يبدأ التحديث
+    - يضمن أن الكاش جاهز تماماً عند الفحص
+    """
     while True:
-        time.sleep(45)
-        if fast_prefetch_done.is_set():
-            with symbols_cache_lock: syms = list(symbols_cache)
-            if syms: _update_batch(syms, "1m", limit=15)
+        if not fast_prefetch_done.is_set():
+            time.sleep(5)
+            continue
+
+        # احسب متى تغلق الشمعة القادمة
+        nxt  = get_next_close(1)
+        wait = (nxt - datetime.now(timezone.utc)).total_seconds()
+
+        # ابدأ التحديث قبل 10 ثوانٍ من الإغلاق
+        pre_update = wait - 10
+        if pre_update > 0:
+            time.sleep(pre_update)
+
+        # الآن حدّث الكاش بشكل متوازي
+        with symbols_cache_lock: syms = list(symbols_cache)
+        if syms:
+            log.info(f"🔄 تحديث 1m لـ {len(syms)} عملة (قبل إغلاق الشمعة)")
+            _update_batch(syms, "1m", limit=5)
+
+        # انتظر بقية الوقت حتى إغلاق الشمعة + ثانية واحدة
+        remaining = (nxt - datetime.now(timezone.utc)).total_seconds() + 1.0
+        if remaining > 0:
+            time.sleep(remaining)
 
 def cache_updater_60m():
     while True:
         time.sleep(45 * 60)
         if fast_prefetch_done.is_set():
             with symbols_cache_lock: syms = list(symbols_cache)
-            if syms: _update_batch(syms, "60m", limit=5)
+            if syms:
+                _update_batch(syms, "60m", limit=5)
 
 # ──────────────────────────────────────────────
 # Resample
@@ -504,25 +569,21 @@ def check_rsi_stoch(df, lookback=10):
     return rsi_cross and cross_20 and cross_d
 
 # ──────────────────────────────────────────────
-# /check5 helper
+# ✅ /check5 — قراءة أي عملة على فريم 5 دقائق
 # ──────────────────────────────────────────────
 def handle_check5(chat_id, symbol="BTCUSDT"):
     send_telegram(f"🔄 جاري جلب بيانات {symbol} — فريم 5 دقايق...", chat_id)
     try:
-        # نجيب 600 شمعة 1m = 10 ساعات كافية للـ warm-up
         df_raw = get_ohlcv(symbol, "1m", limit=600)
-
-        # إذا الكاش فيه بيانات أكثر نستخدمه
         cached = get_cached(symbol, "1m")
         if not cached.empty and len(cached) > len(df_raw):
             df_raw = cached
 
         if df_raw.empty:
-            send_telegram("❌ فشل جلب البيانات من KuCoin", chat_id)
+            send_telegram("❌ فشل جلب البيانات من MEXC", chat_id)
             return
 
         df5 = resample_ohlcv(df_raw, 5)
-
         if df5.empty or len(df5) < MIN_CANDLES:
             send_telegram(
                 f"⚠️ شموع غير كافية: {len(df5)} (المطلوب {MIN_CANDLES})\n"
@@ -530,63 +591,35 @@ def handle_check5(chat_id, symbol="BTCUSDT"):
             )
             return
 
-        # ── الشمعة المغلقة الأخيرة [-2] ──
         price      = df5["close"].iloc[-2]
         candle_ts  = df5["ts"].iloc[-2].strftime("%Y-%m-%d %H:%M UTC")
         fetch_ts   = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
 
-        # RSI
         rsi_series = calc_rsi_tv(df5["close"], period=14)
         rsi_val    = round(float(rsi_series.iloc[-2]), 2)
 
-        # Stochastic
         k_series, d_series = calc_stoch_tv(df5["close"], df5["high"], df5["low"])
         stoch_k = round(float(k_series.iloc[-2]), 2)
         stoch_d = round(float(d_series.iloc[-2]), 2)
 
-        # MACD
         macd_line, signal_line, histogram = _calc_macd_full(df5["close"])
         macd_hist_val   = round(float(histogram.iloc[-2]), 4)
         macd_line_val   = round(float(macd_line.iloc[-2]), 4)
         signal_line_val = round(float(signal_line.iloc[-2]), 4)
         macd_color      = "🟢" if macd_hist_val > 0 else "🔴"
 
-        # SMI
         smi_val, smi_sig = get_smi_value(df5)
 
-        # Donchian
         don_green = check_donchian_ribbon(df5, direction="green")
         don_red   = check_donchian_ribbon(df5, direction="red")
-        if don_green:
-            don_color = "🟢 أخضر (صاعد)"
-        elif don_red:
-            don_color = "🔴 أحمر (هابط)"
-        else:
-            don_color = "⚪ محايد"
+        if don_green:   don_color = "🟢 أخضر (صاعد)"
+        elif don_red:   don_color = "🔴 أحمر (هابط)"
+        else:           don_color = "⚪ محايد"
 
-        # RSI zone
-        if rsi_val < 30:
-            rsi_zone = "🔴 تشبع بيعي"
-        elif rsi_val > 70:
-            rsi_zone = "🟠 تشبع شرائي"
-        else:
-            rsi_zone = "🟡 محايد"
-
-        # Stoch zone
-        if stoch_k < 20:
-            stoch_zone = "🔴 تشبع بيعي"
-        elif stoch_k > 80:
-            stoch_zone = "🟠 تشبع شرائي"
-        else:
-            stoch_zone = "🟡 محايد"
-
-        # SMI zone
-        if smi_val is not None and smi_val <= -40:
-            smi_zone = "🔴 تشبع بيعي"
-        elif smi_val is not None and smi_val >= 40:
-            smi_zone = "🟠 تشبع شرائي"
-        else:
-            smi_zone = "🟡 محايد"
+        rsi_zone   = "🔴 تشبع بيعي" if rsi_val < 30 else ("🟠 تشبع شرائي" if rsi_val > 70 else "🟡 محايد")
+        stoch_zone = "🔴 تشبع بيعي" if stoch_k < 20 else ("🟠 تشبع شرائي" if stoch_k > 80 else "🟡 محايد")
+        smi_zone   = ("🔴 تشبع بيعي" if smi_val is not None and smi_val <= -40
+                      else ("🟠 تشبع شرائي" if smi_val is not None and smi_val >= 40 else "🟡 محايد"))
 
         send_telegram(
             f"📊 <b>{symbol} — فريم 5 دقايق</b>\n"
@@ -809,7 +842,7 @@ def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
     )
 
 # ──────────────────────────────────────────────
-# Candle Watcher
+# ✅ Candle Watcher — مع 50 worker للفحص السريع
 # ──────────────────────────────────────────────
 def get_next_close(tf_minutes):
     now   = datetime.now(timezone.utc)
@@ -821,6 +854,7 @@ def candle_watcher(entry_min, confirm_min, third_min, ec_api, t_api):
     while True:
         nxt  = get_next_close(entry_min)
         wait = (nxt - datetime.now(timezone.utc)).total_seconds()
+        # انتظر إغلاق الشمعة + ثانيتين للتأكد
         time.sleep(max(wait, 0) + 2.0)
         cleanup_alerted_keys()
         cleanup_near6()
@@ -833,7 +867,8 @@ def candle_watcher(entry_min, confirm_min, third_min, ec_api, t_api):
             entry_min=entry_min, confirm_min=confirm_min,
             third_min=third_min, ec_api=ec_api, t_api=t_api,
         )
-        with ThreadPoolExecutor(max_workers=6) as ex:
+        # ✅ رفعنا من 6 إلى 50 worker — 200 عملة تُفحص في 2-4 ثوانٍ
+        with ThreadPoolExecutor(max_workers=50) as ex:
             ex.map(fn, syms)
 
 # ──────────────────────────────────────────────
@@ -917,7 +952,7 @@ def poll_telegram_commands():
                     with near_signals_lock:  near  = len(near_signals)
                     with near_signals_6_lock: near6 = len(near_signals_6)
                     send_telegram(
-                        f"🤖 البوت يعمل — KuCoin API\n"
+                        f"🤖 البوت يعمل — MEXC API\n"
                         f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
                         f"📊 إجمالي الإشارات: {cnt}\n"
                         f"🔴 قريبة من الإشارة (7/8): {near}\n"
@@ -937,7 +972,7 @@ def poll_telegram_commands():
                         lines.append(f"• {sym} [{tf}]: {len(df)} شمعة")
                     send_telegram("\n".join(lines), chat_id)
                 elif txt == "/fetchtest":
-                    send_telegram("🔄 جاري اختبار KuCoin API...", chat_id)
+                    send_telegram("🔄 جاري اختبار MEXC API...", chat_id)
                     results = []
                     for tf in ["1m", "60m"]:
                         df = get_ohlcv("BTCUSDT", tf, limit=10)
@@ -948,7 +983,7 @@ def poll_telegram_commands():
                     with ohlcv_cache_lock: cache_keys = len(ohlcv_cache)
                     results += [f"💾 الكاش: {cache_keys} مفتاح",
                                 f"⚡ {'✅' if fast_prefetch_done.is_set() else '⏳'}"]
-                    send_telegram("🧪 <b>نتيجة اختبار KuCoin:</b>\n" + "\n".join(results), chat_id)
+                    send_telegram("🧪 <b>نتيجة اختبار MEXC:</b>\n" + "\n".join(results), chat_id)
                 elif txt == "/reload":
                     with symbols_cache_lock: syms = list(symbols_cache)
                     if not syms:
@@ -958,16 +993,14 @@ def poll_telegram_commands():
                         threading.Thread(target=prefetch_all, args=(syms,), daemon=True).start()
                         send_telegram(f"🚀 بدأ إعادة التحميل لـ {len(syms)} عملة...", chat_id)
 
-                # ── /check5 ──────────────────────────────────────────
                 elif txt.startswith("/check5"):
-                    parts = txt.split()
+                    parts  = txt.split()
                     symbol = parts[1].upper() if len(parts) > 1 else "BTCUSDT"
                     if not symbol.endswith("USDT"):
                         symbol = symbol + "USDT"
                     threading.Thread(
                         target=handle_check5, args=(chat_id, symbol), daemon=True
                     ).start()
-                # ─────────────────────────────────────────────────────
 
                 elif txt == "/help":
                     send_telegram(
@@ -979,10 +1012,10 @@ def poll_telegram_commands():
                         "⭐  <code>/blocked</code> — عملات محجوبة بالفريم الأكبر\n"
                         "📊  <code>/status</code> — حالة البوت\n"
                         "🔬  <code>/cache</code> — فحص الكاش\n"
-                        "🧪  <code>/fetchtest</code> — اختبار KuCoin\n"
+                        "🧪  <code>/fetchtest</code> — اختبار MEXC\n"
                         "🔄  <code>/reload</code> — إعادة تحميل الكاش\n"
                         "🔍  <code>/سبب</code> — تشخيص الإشارات\n"
-                        "📊  <code>/check5</code> — قراءة BTC 5 دقايق (أو /check5 ETH)\n"
+                        "📊  <code>/check5 BTC</code> — قراءة BTC 5 دقايق (أو أي عملة)\n"
                         "📋  <code>/help</code> — قائمة الأوامر",
                         chat_id,
                     )
@@ -993,29 +1026,34 @@ def poll_telegram_commands():
             time.sleep(10)
 
 # ──────────────────────────────────────────────
-# Symbols Loop
+# ✅ جلب قائمة العملات من MEXC
 # ──────────────────────────────────────────────
 def update_symbols_loop():
     first = True
     while True:
         try:
             resp = get_session().get(
-                f"{KUCOIN_BASE}/api/v1/market/allTickers", timeout=20,
+                f"{MEXC_BASE}/api/v3/ticker/24hr",
+                timeout=20,
             ).json()
-            tickers = resp.get("data", {}).get("ticker", [])
-            if tickers:
+            if isinstance(resp, list) and resp:
                 top = sorted(
-                    [t for t in tickers if t["symbol"].endswith("-USDT")],
-                    key=lambda x: float(x.get("volValue", 0)), reverse=True,
+                    [t for t in resp if t["symbol"].endswith("USDT")
+                     and "_" not in t["symbol"]],   # نستبعد رموز غريبة
+                    key=lambda x: float(x.get("quoteVolume", 0)),
+                    reverse=True,
                 )[:TOP_SYMBOLS_LIMIT]
-                new_syms = [from_kucoin_symbol(t["symbol"]) for t in top]
+                new_syms = [t["symbol"] for t in top]
                 with symbols_cache_lock:
                     symbols_cache.clear(); symbols_cache.extend(new_syms)
-                log.info(f"✅ عملات: {len(new_syms)} — أول 5: {new_syms[:5]}")
+                log.info(f"✅ عملات MEXC: {len(new_syms)} — أول 5: {new_syms[:5]}")
                 if first:
                     first = False
-                    threading.Thread(target=prefetch_all, args=(list(new_syms),), daemon=True).start()
+                    threading.Thread(
+                        target=prefetch_all, args=(list(new_syms),), daemon=True
+                    ).start()
             else:
+                log.warning(f"⚠️ MEXC ticker رد غير متوقع: {str(resp)[:100]}")
                 if first: _start_fallback(); first = False
         except Exception as e:
             log.error(f"Symbols loop error: {e}")
@@ -1023,9 +1061,11 @@ def update_symbols_loop():
         time.sleep(3600)
 
 def _start_fallback():
-    fallback = ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT",
-                "DOGEUSDT","ADAUSDT","AVAXUSDT","DOTUSDT","MATICUSDT",
-                "LINKUSDT","UNIUSDT","LTCUSDT","ATOMUSDT","NEARUSDT"]
+    fallback = [
+        "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT",
+        "DOGEUSDT","ADAUSDT","AVAXUSDT","DOTUSDT","MATICUSDT",
+        "LINKUSDT","UNIUSDT","LTCUSDT","ATOMUSDT","NEARUSDT",
+    ]
     with symbols_cache_lock:
         symbols_cache.clear(); symbols_cache.extend(fallback)
     log.warning(f"⚠️ fallback: {len(fallback)} عملة")
@@ -1037,25 +1077,34 @@ class HealthHandler(BaseHTTPRequestHandler):
     def log_message(self, *_): pass
 
 # ──────────────────────────────────────────────
-# Main
+# ✅ BTC 5m Auto Watcher — يُرسل بعد كل إغلاق شمعة 5 دقائق
 # ──────────────────────────────────────────────
 def check5_watcher():
+    """يُرسل تقرير BTC كل 5 دقائق تلقائياً بعد إغلاق الشمعة"""
     while True:
         nxt  = get_next_close(5)
         wait = (nxt - datetime.now(timezone.utc)).total_seconds()
-        time.sleep(max(wait, 0) + 2.0)
+        time.sleep(max(wait, 0) + 2.0)   # + ثانيتان بعد الإغلاق
         if not fast_prefetch_done.is_set():
             continue
-        handle_check5(TELEGRAM_CHAT_ID, "BTCUSDT")
+        # أرسل في thread منفصل لعدم تأخير الـ watcher
+        threading.Thread(
+            target=handle_check5,
+            args=(TELEGRAM_CHAT_ID, "BTCUSDT"),
+            daemon=True,
+        ).start()
 
+# ──────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────
 def main():
-    log.info("🚀 Tripling Strategy Bot — KuCoin API (TV-Match v2)")
+    log.info("🚀 Tripling Strategy Bot — MEXC API (v3)")
     delete_webhook()
     threading.Thread(target=update_symbols_loop, daemon=True).start()
     while not symbols_cache: time.sleep(1)
     threading.Thread(target=poll_telegram_commands, daemon=True).start()
-    threading.Thread(target=cache_updater_1m,       daemon=True).start()
-    threading.Thread(target=cache_updater_60m,      daemon=True).start()
+    threading.Thread(target=cache_updater_1m,       daemon=True).start()   # ✅ متوازي ذكي
+    threading.Thread(target=cache_updater_60m,      daemon=True).start()   # ✅ متوازي
     threading.Thread(target=send_diag_report,       daemon=True).start()
     threading.Thread(
         target=lambda: HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever(),
@@ -1064,13 +1113,18 @@ def main():
     log.info("⏳ انتظار اكتمال التحميل السريع…")
     fast_prefetch_done.wait()
     log.info("✅ بدء الواتشرز")
+
+    # ✅ واتشر BTC 5 دقائق التلقائي
     threading.Thread(target=check5_watcher, daemon=True).start()
+
+    # ✅ واتشرز الإشارات الرئيسية — 50 worker لكل زوج
     for entry_min, confirm_min, third_min, ec_api, t_api in TRIPLING_PAIRS:
         threading.Thread(
             target=candle_watcher,
             args=(entry_min, confirm_min, third_min, ec_api, t_api),
             daemon=True,
         ).start()
+
     log.info("✅ جميع الواتشرز تعمل.")
     while True: time.sleep(60)
 
