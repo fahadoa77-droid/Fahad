@@ -89,6 +89,69 @@ cache_diag_logged = threading.Event()
 _local            = threading.local()
 
 # ──────────────────────────────────────────────
+# تشخيص /سبب
+# ──────────────────────────────────────────────
+DIAG_LABELS = {
+    "no_data"         : "بيانات ناقصة",
+    "smi_oversold"    : "SMI مش في التشبع البيعي",
+    "active_skip"     : "SMI الفريم الأكبر لم يتأكد",
+    "macd_red"        : "MACD الرئيسي مش أحمر",
+    "donchian_entry"  : "Donchian Ribbon الرئيسي مش أخضر",
+    "donchian_confirm": "Donchian Ribbon Confirm مش أخضر",
+    "macd_confirm"    : "MACD Confirm مش أخضر (×3)",
+    "ema50"           : "السعر فوق EMA50",
+    "rsi_stoch"       : "RSI/Stochastic ما اتحقق",
+}
+
+STEP_LABELS = {
+    "no_data"         : "بيانات كافية ✅",
+    "smi_oversold"    : "① تشبع بيعي SMI ✅",
+    "active_skip"     : "⭐ الفريم الأكبر ليس في تشبع بيعي ✅",
+    "macd_red"        : "③ MACD أحمر ✅",
+    "donchian_entry"  : "④ Donchian Ribbon أخضر ✅",
+    "donchian_confirm": "⑤ Donchian Confirm أخضر ✅",
+    "macd_confirm"    : "⑥ MACD Confirm أخضر (×3) ✅",
+    "ema50"           : "⑦ السعر تحت EMA50 ✅",
+    "rsi_stoch"       : "⑧ RSI تقاطع + Stochastic ✅",
+}
+
+def build_diag_msg(reset=False):
+    with diag_lock:
+        t = diag_counts["total"] or 1
+        non_total = {k: v for k, v in diag_counts.items() if k not in ["total", "passed"]}
+        worst_k = max(non_total, key=lambda k: non_total[k])
+        worst_v = non_total[worst_k]
+        lines = [
+            "🔍 <b>تقرير التشخيص</b>", "━━━━━━━━━━━━━━━",
+            f"📊 إجمالي الفحوصات: <b>{t}</b>", "",
+        ]
+        remaining = t
+        for k, pass_label in STEP_LABELS.items():
+            failed   = diag_counts[k]
+            passed   = remaining - failed
+            pass_pct = int(passed / t * 100)
+            fail_pct = int(failed / t * 100)
+            bar = "█" * (pass_pct // 10) + "░" * (10 - pass_pct // 10)
+            lines.append(
+                f"{pass_label}\n"
+                f"    {bar} نجح: {passed} ({pass_pct}%) | فشل: {failed} ({fail_pct}%)"
+            )
+            remaining = passed
+        lines += [
+            "", f"🏆 اجتازت الكل: <b>{diag_counts['passed']}</b>",
+            "━━━━━━━━━━━━━━━",
+            f"⚠️ أكثر سبب فشل: <b>{DIAG_LABELS.get(worst_k, worst_k)}</b> ({worst_v})",
+        ]
+        if reset:
+            for k in diag_counts: diag_counts[k] = 0
+    return "\n".join(lines)
+
+def send_diag_report():
+    while True:
+        time.sleep(3600)
+        send_telegram(build_diag_msg(reset=True))
+
+# ──────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────
 def get_session():
@@ -471,16 +534,64 @@ def check5_watcher():
 def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
     raw_ec = get_cached(symbol, ec_api)
     raw_t  = get_cached(symbol, t_api)
-    if raw_ec.empty or raw_t.empty: return
+
+    with diag_lock: diag_counts["total"] += 1
+
+    if raw_ec.empty or raw_t.empty:
+        with diag_lock: diag_counts["no_data"] += 1
+        return
+
     df_entry   = resample_ohlcv(raw_ec, entry_min)
     df_confirm = resample_ohlcv(raw_ec, confirm_min)
     df_third   = resample_ohlcv(raw_t,  third_min)
-    if df_entry.empty or df_confirm.empty or df_third.empty: return
-    if (check_smi_oversold(df_entry) and check_macd_red(df_entry) and
-        check_donchian_ribbon(df_entry, "green") and check_donchian_ribbon(df_confirm, "green") and
-        check_macd_green(df_confirm) and check_ema50_below(df_entry) and check_rsi_stoch(df_third)):
-        save_signal(symbol, df_entry["close"].iloc[-2], entry_min, confirm_min, third_min)
-        send_telegram(f"🚨 <b>إشارة دخول:</b> {symbol} | {entry_min}m")
+
+    if df_entry.empty or df_confirm.empty or df_third.empty:
+        with diag_lock: diag_counts["no_data"] += 1
+        return
+
+    if not check_smi_oversold(df_entry):
+        with diag_lock: diag_counts["smi_oversold"] += 1
+        return
+
+    next_tf = NEXT_TF.get(entry_min)
+    if next_tf:
+        df_next = resample_ohlcv(raw_ec, next_tf)
+        if not df_next.empty and check_smi_oversold(df_next):
+            with diag_lock: diag_counts["active_skip"] += 1
+            return
+
+    if not check_macd_red(df_entry):
+        with diag_lock: diag_counts["macd_red"] += 1
+        return
+
+    if not check_donchian_ribbon(df_entry, "green"):
+        with diag_lock: diag_counts["donchian_entry"] += 1
+        return
+
+    if not check_donchian_ribbon(df_confirm, "green"):
+        with diag_lock: diag_counts["donchian_confirm"] += 1
+        return
+
+    if not check_macd_green(df_confirm):
+        with diag_lock: diag_counts["macd_confirm"] += 1
+        return
+
+    if not check_ema50_below(df_entry):
+        with diag_lock: diag_counts["ema50"] += 1
+        return
+
+    if not check_rsi_stoch(df_third):
+        with diag_lock: diag_counts["rsi_stoch"] += 1
+        return
+
+    with diag_lock: diag_counts["passed"] += 1
+
+    price = df_entry["close"].iloc[-2]
+    save_signal(symbol, price, entry_min, confirm_min, third_min)
+    send_telegram(
+        f"🚨 <b>إشارة دخول:</b> {symbol} | {entry_min}m/{confirm_min}m/{third_min}m\n"
+        f"💰 السعر: {price:.6g}"
+    )
 
 def candle_watcher(entry_min, confirm_min, third_min, ec_api, t_api):
     while True:
@@ -511,13 +622,31 @@ def poll_telegram_commands():
                 if not txt or not chat_id: continue
 
                 if txt == "/status":
-                    send_telegram("🤖 البوت يعمل بكفاءة — Binance API.", chat_id)
+                    with trades_lock:       cnt    = len(trades_history)
+                    with alerted_keys_lock: active = len(alerted_keys)
+                    with ohlcv_cache_lock:  keys   = len(ohlcv_cache)
+                    send_telegram(
+                        f"🤖 البوت يعمل — Binance API\n"
+                        f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
+                        f"📊 إجمالي الإشارات: {cnt}\n"
+                        f"🔑 تنبيهات نشطة: {active}\n"
+                        f"💾 الكاش: {keys} مفتاح\n"
+                        f"⚡ تحميل سريع: {'✅' if fast_prefetch_done.is_set() else '⏳'}\n"
+                        f"📦 تحميل كامل: {'✅' if prefetch_done.is_set() else '⏳'}",
+                        chat_id,
+                    )
                 elif txt in ("1", "/today"):
                     send_telegram(get_report("today"), chat_id)
                 elif txt in ("2", "/yesterday"):
                     send_telegram(get_report("yesterday"), chat_id)
                 elif txt in ("3", "/week"):
                     send_telegram(get_report("week"), chat_id)
+                elif txt in ("/سبب", "/diag"):
+                    send_telegram(
+                        "⚠️ لا توجد بيانات بعد." if diag_counts["total"] == 0
+                        else build_diag_msg(reset=False),
+                        chat_id,
+                    )
                 elif txt.startswith("/check5"):
                     parts  = txt.split()
                     symbol = parts[1].upper() if len(parts) > 1 else "BTCUSDT"
@@ -533,6 +662,7 @@ def poll_telegram_commands():
                         "1️⃣ <code>1</code> — إشارات اليوم\n"
                         "2️⃣ <code>2</code> — إشارات أمس\n"
                         "3️⃣ <code>3</code> — آخر 7 أيام\n"
+                        "🔍 <code>/سبب</code> — تقرير التشخيص\n"
                         "📊 <code>/status</code> — حالة البوت\n"
                         "📋 <code>/help</code> — قائمة الأوامر",
                         chat_id,
@@ -547,7 +677,6 @@ def update_symbols_loop():
     while True:
         try:
             resp = get_session().get(f"{BINANCE_BASE}/api/v3/ticker/24hr").json()
-            # Binance يرجع list من dicts
             if isinstance(resp, list):
                 tickers = resp
             elif isinstance(resp, dict):
@@ -585,6 +714,7 @@ def main():
     threading.Thread(target=cache_updater_1m,        daemon=True).start()
     threading.Thread(target=cache_updater_60m,       daemon=True).start()
     threading.Thread(target=check5_watcher,          daemon=True).start()
+    threading.Thread(target=send_diag_report,        daemon=True).start()
     threading.Thread(
         target=lambda: HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever(),
         daemon=True,
