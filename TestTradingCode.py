@@ -14,14 +14,11 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────
-# ⚙️ الإعدادات الرئيسية
-# ──────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN",   "8988740597:AAE_I7M7zB5VM2NykUwreQQMws0vk7qlU78")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "7801703329")
 
 BINANCE_BASE = "https://data-api.binance.vision"
-TOP_SYMBOLS_LIMIT = 200
+TOP_SYMBOLS_LIMIT = 25
 PORT              = int(os.environ.get("PORT", "8080"))
 ALERT_EXPIRY_HOURS = 4
 NEAR6_EXPIRY_HOURS = 2
@@ -60,9 +57,6 @@ WARMUP_STOCH = 100
 WARMUP_DON   = 50
 MIN_CANDLES  = 250
 
-# ──────────────────────────────────────────────
-# الحالة المشتركة
-# ──────────────────────────────────────────────
 alerted_keys        = {}
 alerted_keys_lock   = threading.Lock()
 trades_history      = deque(maxlen=2000)
@@ -88,9 +82,6 @@ diag_lock         = threading.Lock()
 cache_diag_logged = threading.Event()
 _local            = threading.local()
 
-# ──────────────────────────────────────────────
-# تشخيص /سبب
-# ──────────────────────────────────────────────
 DIAG_LABELS = {
     "no_data"         : "بيانات ناقصة",
     "smi_oversold"    : "SMI مش في التشبع البيعي",
@@ -151,9 +142,6 @@ def send_diag_report():
         time.sleep(3600)
         send_telegram(build_diag_msg(reset=True))
 
-# ──────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────
 def get_session():
     if not hasattr(_local, "s"):
         s = requests.Session()
@@ -230,9 +218,6 @@ def get_report(period="today"):
         )
     return "\n".join(lines)
 
-# ──────────────────────────────────────────────
-# Binance OHLCV
-# ──────────────────────────────────────────────
 def _parse_binance_klines(resp):
     df = pd.DataFrame(resp, columns=[
         "ts","open","high","low","close","vol",
@@ -311,6 +296,7 @@ def prefetch_all(symbols):
             df = get_ohlcv_full(sym, tf, target=n)
             cache_merge(sym, tf, df)
     fast_prefetch_done.set()
+    send_telegram("⚡ <b>التحميل السريع اكتمل — البوت يعمل الآن!</b>")
     for sym in symbols:
         for tf, n in API_FETCH_CANDLES.items():
             df = get_ohlcv_full(sym, tf, target=n)
@@ -339,9 +325,6 @@ def cache_updater_60m():
             with symbols_cache_lock: syms = list(symbols_cache)
             if syms: _update_batch(syms, "60m", limit=5)
 
-# ──────────────────────────────────────────────
-# المؤشرات الفنية
-# ──────────────────────────────────────────────
 def resample_ohlcv(df, minutes):
     if df.empty: return pd.DataFrame()
     return (df.copy().set_index("ts")
@@ -432,9 +415,6 @@ def check_rsi_stoch(df):
              (df["high"].rolling(15).max() - df["low"].rolling(15).min() + 1e-10) * 100)
     return bool(rsi.iloc[-2] < 35 and k.iloc[-2] < 20)
 
-# ──────────────────────────────────────────────
-# check5 — تقرير BTC كل 5 دقايق
-# ──────────────────────────────────────────────
 def handle_check5(chat_id, symbol="BTCUSDT"):
     send_telegram(f"🔄 جاري جلب بيانات {symbol} — فريم 5 دقايق...", chat_id)
     try:
@@ -442,50 +422,39 @@ def handle_check5(chat_id, symbol="BTCUSDT"):
         cached = get_cached(symbol, "1m")
         if not cached.empty and len(cached) > len(df_raw):
             df_raw = cached
-
         if df_raw.empty:
             send_telegram("❌ فشل جلب البيانات من Binance", chat_id)
             return
-
         df5 = resample_ohlcv(df_raw, 5)
-
         if df5.empty or len(df5) < MIN_CANDLES:
             send_telegram(
                 f"⚠️ شموع غير كافية: {len(df5)} (المطلوب {MIN_CANDLES})\n"
                 f"💡 جرب بعد اكتمال التحميل الكامل", chat_id
             )
             return
-
         price      = df5["close"].iloc[-2]
         candle_ts  = df5["ts"].iloc[-2].strftime("%Y-%m-%d %H:%M UTC")
         fetch_ts   = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-
         rsi_series = calc_rsi_tv(df5["close"], period=14)
         rsi_val    = round(float(rsi_series.iloc[-2]), 2)
-
         k_series, d_series = calc_stoch_tv(df5["close"], df5["high"], df5["low"])
         stoch_k = round(float(k_series.iloc[-2]), 2)
         stoch_d = round(float(d_series.iloc[-2]), 2)
-
         macd_line, signal_line, histogram = _calc_macd_full(df5["close"])
         macd_hist_val   = round(float(histogram.iloc[-2]), 4)
         macd_line_val   = round(float(macd_line.iloc[-2]), 4)
         signal_line_val = round(float(signal_line.iloc[-2]), 4)
         macd_color      = "🟢" if macd_hist_val > 0 else "🔴"
-
         smi_val, smi_sig = get_smi_value(df5)
-
         don_green = check_donchian_ribbon(df5, direction="green")
         don_red   = check_donchian_ribbon(df5, direction="red")
         if don_green:   don_color = "🟢 أخضر (صاعد)"
         elif don_red:   don_color = "🔴 أحمر (هابط)"
         else:           don_color = "⚪ محايد"
-
         rsi_zone   = "🔴 تشبع بيعي" if rsi_val < 30 else ("🟠 تشبع شرائي" if rsi_val > 70 else "🟡 محايد")
         stoch_zone = "🔴 تشبع بيعي" if stoch_k < 20 else ("🟠 تشبع شرائي" if stoch_k > 80 else "🟡 محايد")
         smi_zone   = ("🔴 تشبع بيعي" if smi_val is not None and smi_val <= -40
                       else ("🟠 تشبع شرائي" if smi_val is not None and smi_val >= 40 else "🟡 محايد"))
-
         send_telegram(
             f"📊 <b>{symbol} — فريم 5 دقايق</b>\n"
             f"🕯️ الشمعة المغلقة: <b>{candle_ts}</b>\n"
@@ -528,64 +497,47 @@ def check5_watcher():
         if not fast_prefetch_done.is_set(): continue
         handle_check5(TELEGRAM_CHAT_ID, "BTCUSDT")
 
-# ──────────────────────────────────────────────
-# المسح والمراقبة
-# ──────────────────────────────────────────────
 def scan_symbol(symbol, entry_min, confirm_min, third_min, ec_api, t_api):
     raw_ec = get_cached(symbol, ec_api)
     raw_t  = get_cached(symbol, t_api)
-
     with diag_lock: diag_counts["total"] += 1
-
     if raw_ec.empty or raw_t.empty:
         with diag_lock: diag_counts["no_data"] += 1
         return
-
     df_entry   = resample_ohlcv(raw_ec, entry_min)
     df_confirm = resample_ohlcv(raw_ec, confirm_min)
     df_third   = resample_ohlcv(raw_t,  third_min)
-
     if df_entry.empty or df_confirm.empty or df_third.empty:
         with diag_lock: diag_counts["no_data"] += 1
         return
-
     if not check_smi_oversold(df_entry):
         with diag_lock: diag_counts["smi_oversold"] += 1
         return
-
     next_tf = NEXT_TF.get(entry_min)
     if next_tf:
         df_next = resample_ohlcv(raw_ec, next_tf)
         if not df_next.empty and check_smi_oversold(df_next):
             with diag_lock: diag_counts["active_skip"] += 1
             return
-
     if not check_macd_red(df_entry):
         with diag_lock: diag_counts["macd_red"] += 1
         return
-
     if not check_donchian_ribbon(df_entry, "green"):
         with diag_lock: diag_counts["donchian_entry"] += 1
         return
-
     if not check_donchian_ribbon(df_confirm, "green"):
         with diag_lock: diag_counts["donchian_confirm"] += 1
         return
-
     if not check_macd_green(df_confirm):
         with diag_lock: diag_counts["macd_confirm"] += 1
         return
-
     if not check_ema50_below(df_entry):
         with diag_lock: diag_counts["ema50"] += 1
         return
-
     if not check_rsi_stoch(df_third):
         with diag_lock: diag_counts["rsi_stoch"] += 1
         return
-
     with diag_lock: diag_counts["passed"] += 1
-
     price = df_entry["close"].iloc[-2]
     save_signal(symbol, price, entry_min, confirm_min, third_min)
     send_telegram(
@@ -604,9 +556,6 @@ def candle_watcher(entry_min, confirm_min, third_min, ec_api, t_api):
         with ThreadPoolExecutor(max_workers=20) as ex:
             ex.map(fn, syms)
 
-# ──────────────────────────────────────────────
-# أوامر تيليغرام
-# ──────────────────────────────────────────────
 def poll_telegram_commands():
     last_id = 0
     while True:
@@ -620,7 +569,6 @@ def poll_telegram_commands():
                 txt     = upd.get("message", {}).get("text", "").strip()
                 chat_id = str(upd.get("message", {}).get("chat", {}).get("id", ""))
                 if not txt or not chat_id: continue
-
                 if txt == "/status":
                     with trades_lock:       cnt    = len(trades_history)
                     with alerted_keys_lock: active = len(alerted_keys)
@@ -670,9 +618,6 @@ def poll_telegram_commands():
         except:
             time.sleep(10)
 
-# ──────────────────────────────────────────────
-# Symbols Loop
-# ──────────────────────────────────────────────
 def update_symbols_loop():
     while True:
         try:
@@ -683,13 +628,11 @@ def update_symbols_loop():
                 tickers = resp.get("data", [])
             else:
                 tickers = []
-
             top = sorted(
                 [t for t in tickers if isinstance(t, dict) and t.get("symbol", "").endswith("USDT")],
                 key=lambda x: float(x.get("quoteVolume", 0)),
                 reverse=True
             )[:TOP_SYMBOLS_LIMIT]
-
             with symbols_cache_lock:
                 symbols_cache[:] = [t["symbol"] for t in top]
             log.info(f"✅ عملات: {len(symbols_cache)} — أول 5: {symbols_cache[:5]}")
@@ -704,10 +647,14 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
     def log_message(self, *_): pass
 
-# ──────────────────────────────────────────────
-# Main
-# ──────────────────────────────────────────────
 def main():
+    # ✅ Health Server أول شيء — قبل أي عملية
+    threading.Thread(
+        target=lambda: HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever(),
+        daemon=True,
+    ).start()
+    log.info(f"✅ Health server شغّال على port {PORT}")
+
     delete_webhook()
     threading.Thread(target=update_symbols_loop,    daemon=True).start()
     threading.Thread(target=poll_telegram_commands,  daemon=True).start()
@@ -715,10 +662,6 @@ def main():
     threading.Thread(target=cache_updater_60m,       daemon=True).start()
     threading.Thread(target=check5_watcher,          daemon=True).start()
     threading.Thread(target=send_diag_report,        daemon=True).start()
-    threading.Thread(
-        target=lambda: HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever(),
-        daemon=True,
-    ).start()
     for params in TRIPLING_PAIRS:
         threading.Thread(target=candle_watcher, args=params, daemon=True).start()
     while True:
